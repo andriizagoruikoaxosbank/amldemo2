@@ -38,7 +38,7 @@ st.set_page_config(
 )
 
 # Version number
-APP_VERSION = "1.16"
+APP_VERSION = "1.20"
 
 # Configure logging (optional for Streamlit, but can be helpful)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -141,19 +141,216 @@ if not openai_client:
     st.error(final_error_msg)
     st.stop()
 
-# --- Helper function for Grade Color ---
-def get_grade_color(grade):
-    if grade == 'A': return "green"
-    if grade == 'B': return "#90EE90" # lightgreen
-    if grade == 'C': return "orange"
-    if grade == 'D': return "#FF4500" # orangered
-    if grade == 'F': return "red"
+# --- Helper function for Recommendation Color ---
+def get_recommendation_color(recommendation):
+    if recommendation == 'PROCEED': return "green"
+    if recommendation == 'ENHANCED DUE DILIGENCE': return "orange"
+    if recommendation == 'HIGH RISK': return "#FF4500" # orangered
+    if recommendation == 'DO NOT PROCEED': return "red"
     return "grey"
 # --- End Helper Function ---
 
+# --- Helper function for OFAC PDF Formatting ---
+def format_ofac_for_pdf(text, story, styles):
+    """Format OFAC results as separate PDF elements with proper spacing"""
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.platypus import Spacer, Paragraph
+    from reportlab.lib.units import inch
+    
+    lines = text.split('\n')
+    
+    # Define styles for OFAC formatting
+    header_style = ParagraphStyle(
+        name='OFACHeader', 
+        parent=styles['Normal'], 
+        fontSize=12, 
+        fontName='Helvetica-Bold',
+        spaceAfter=12,
+        spaceBefore=6,
+        textColor=colors.darkred if '🚨' in text else colors.darkgreen
+    )
+    
+    subheader_style = ParagraphStyle(
+        name='OFACSubheader', 
+        parent=styles['Normal'], 
+        fontSize=11, 
+        fontName='Helvetica-Bold',
+        spaceAfter=8,
+        spaceBefore=8
+    )
+    
+    body_style = ParagraphStyle(
+        name='OFACBody', 
+        parent=styles['Normal'], 
+        fontSize=10,
+        spaceAfter=4,
+        leading=12
+    )
+    
+    bullet_style = ParagraphStyle(
+        name='OFACBullet', 
+        parent=styles['Normal'], 
+        fontSize=10,
+        leftIndent=20,
+        spaceAfter=3,
+        leading=12
+    )
+    
+    summary_style = ParagraphStyle(
+        name='OFACSummary', 
+        parent=styles['Normal'], 
+        fontSize=10,
+        fontName='Helvetica-Bold',
+        spaceAfter=6,
+        spaceBefore=8
+    )
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+            
+        # Handle main headers (🚨 SANCTIONS ALERT, ✅ OFAC CLEAR)
+        if line.startswith('🚨') or line.startswith('✅'):
+            # Remove markdown formatting for cleaner display
+            clean_line = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
+            story.append(Paragraph(clean_line, header_style))
+            story.append(Spacer(1, 0.1*inch))
+            
+        # Handle match threshold info
+        elif line.startswith('*(Minimum match threshold'):
+            clean_line = line.replace('*(', '(').replace(')*', ')')
+            story.append(Paragraph(f"<i>{clean_line}</i>", body_style))
+            story.append(Spacer(1, 0.15*inch))
+            
+        # Handle match headers (Match #1:, Match #2:, etc.)
+        elif line.startswith('**Match #'):
+            clean_line = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
+            story.append(Paragraph(clean_line, subheader_style))
+            
+            # Process the details for this match
+            i += 1
+            while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith('**Match #') and not lines[i].strip().startswith('*... and') and not lines[i].strip() == '---':
+                detail_line = lines[i].strip()
+                if detail_line.startswith('•'):
+                    # Handle bullet points
+                    clean_detail = re.sub(r'• \*\*(.*?)\*\*:', r'<b>\1</b>:', detail_line)
+                    story.append(Paragraph(clean_detail, bullet_style))
+                elif detail_line:
+                    story.append(Paragraph(detail_line, bullet_style))
+                i += 1
+            story.append(Spacer(1, 0.1*inch))
+            i -= 1  # Adjust for the outer loop increment
+            
+        # Handle separator lines
+        elif line == '---':
+            story.append(Spacer(1, 0.1*inch))
+            # Add a simple line separator
+            story.append(Paragraph("_" * 50, body_style))
+            story.append(Spacer(1, 0.1*inch))
+            
+        # Handle summary and recommendation
+        elif line.startswith('**Summary**:'):
+            clean_line = re.sub(r'\*\*(.*?)\*\*:', r'<b>\1</b>:', line)
+            story.append(Paragraph(clean_line, summary_style))
+            
+        elif line.startswith('**Recommendation**:'):
+            clean_line = re.sub(r'\*\*(.*?)\*\*:', r'<b>\1</b>:', line)
+            # Color code the recommendation
+            if 'DO NOT PROCEED' in line:
+                rec_style = ParagraphStyle(name='RecStyle', parent=summary_style, textColor=colors.darkred)
+            elif 'ENHANCED DUE DILIGENCE' in line:
+                rec_style = ParagraphStyle(name='RecStyle', parent=summary_style, textColor=colors.orange)
+            else:
+                rec_style = summary_style
+            story.append(Paragraph(clean_line, rec_style))
+            
+        # Handle additional matches info
+        elif line.startswith('*... and'):
+            clean_line = line.replace('*', '')
+            story.append(Paragraph(f"<i>{clean_line}</i>", body_style))
+            story.append(Spacer(1, 0.1*inch))
+            
+        # Handle regular content lines
+        else:
+            if '**' in line:
+                clean_line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+                story.append(Paragraph(clean_line, body_style))
+            elif line and not line.isspace():
+                story.append(Paragraph(line, body_style))
+                
+        i += 1
+
 # --- Helper function for Inline Markdown (Bold/Italic) ---
+def format_ofac_results(text):
+    """Special formatter for OFAC results with proper structure and spacing"""
+    lines = text.split('\n')
+    formatted_lines = []
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Handle main headers (🚨 SANCTIONS ALERT, ✅ OFAC CLEAR)
+        if line.startswith('🚨') or line.startswith('✅'):
+            formatted_lines.append(f'<br/><br/><b>{line}</b><br/>')
+        # Handle match threshold info
+        elif line.startswith('*(Minimum match threshold'):
+            formatted_lines.append(f'<i>{line}</i><br/><br/>')
+        # Handle match headers (Match #1:, Match #2:, etc.)
+        elif line.startswith('**Match #'):
+            formatted_lines.append(f'<br/><b>{line.replace("**", "")}</b><br/>')
+        # Handle bullet points with proper indentation
+        elif line.startswith('• **'):
+            # Extract the key and value for better formatting
+            formatted_line = line.replace('• **', '    • <b>').replace('**: ', '</b>: ')
+            formatted_lines.append(f'{formatted_line}<br/>')
+        # Handle separator lines
+        elif line == '---':
+            formatted_lines.append('<br/><hr/><br/>')
+        # Handle summary and recommendation headers
+        elif line.startswith('**Summary**:'):
+            formatted_lines.append(f'<br/><b>Summary</b>: {line.replace("**Summary**: ", "")}<br/>')
+        elif line.startswith('**Recommendation**:'):
+            formatted_lines.append(f'<br/><b>Recommendation</b>: {line.replace("**Recommendation**: ", "")}<br/>')
+        # Handle additional matches info
+        elif line.startswith('*... and'):
+            formatted_lines.append(f'<br/><i>{line}</i><br/>')
+        # Handle any other bold text
+        elif '**' in line:
+            formatted_line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+            formatted_lines.append(f'{formatted_line}<br/>')
+        # Handle regular lines
+        else:
+            if line and not line.isspace():
+                formatted_lines.append(f'{line}<br/>')
+    
+    result = ''.join(formatted_lines)
+    
+    # Clean up excessive line breaks
+    result = re.sub(r'(<br/>){3,}', '<br/><br/>', result)
+    
+    # Escape special characters but preserve our HTML tags
+    result = result.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    
+    # Restore the HTML tags we want to keep
+    result = result.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+    result = result.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+    result = result.replace('&lt;br/&gt;', '<br/>')
+    result = result.replace('&lt;hr/&gt;', '<hr/>')
+    
+    return result
+
 def apply_inline_markdown(text):
     """Convert basic markdown to ReportLab-compatible HTML, handling line breaks properly"""
+    # Check if this is OFAC results and use special formatter
+    if ('SANCTIONS ALERT' in text or 'OFAC CLEAR' in text or 'Match #' in text):
+        return format_ofac_results(text)
+    
     # Convert **bold** -> <b>bold</b>
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     
@@ -262,16 +459,28 @@ def search_with_perplexity(company_name, model="sonar-pro"):
     try:
         # Updated Prompt: Ask for explicit separation with headings
         prompt = (
-            f"First, on a single line, provide an Anti-Money Laundering (AML) risk grade for the company '{company_name}' based *only* on the negative news search results below. Use a scale from A (very low risk) to F (very high risk). Format this line ONLY as: 'AML Risk Grade: [GRADE]'. "
-            f"\n\nThen provide a section clearly titled (bold text) 'Company Summary' with a brief summary of the company '{company_name}'. Insert two line breaks after the summary.  "
-            f"\n\nAfter the summary, provide a section clearly titled (bold text) 'Negative News Findings' summarizing any negative news found regarding this company, focusing *only* on the following keywords: {NEGATIVE_KEYWORDS}. "
-            f"\n\nFor the negative news findings, organize them into clear categories such as 'Financial Crimes', 'Regulatory Issues', 'Legal Proceedings', etc. For each finding, include when it happened, key parties involved, and current status if available. If no relevant negative news is found in a category, state that clearly."
-            f"\n\nUse double line breaks between paragraphs. Provide citations as numeric references like [1], [2] etc., within the text where applicable."
+            f"Provide a comprehensive AML (Anti-Money Laundering) due diligence assessment for '{company_name}'. "
+            f"\n\nStructure your response as follows:"
+            f"\n\n## Company Summary"
+            f"\nProvide a brief summary of the company '{company_name}', including business activities, key executives, and geographic presence.\n"
+            f"\n\n## AML Risk Assessment"
+            f"\nAnalyze any negative news found regarding this company, focusing on: {NEGATIVE_KEYWORDS}. "
+            f"Organize findings into clear categories such as 'Financial Crimes', 'Regulatory Issues', 'Legal Proceedings', etc. "
+            f"For each finding, include when it happened, key parties involved, and current status if available. "
+            f"If no relevant negative news is found in a category, state that clearly.\n"
+            f"\n\n## Summary & Recommendation"
+            f"\nProvide a clear summary of key risks identified and a specific recommendation on how to proceed with this entity. "
+            f"Use one of these recommendation categories:"
+            f"\n- **PROCEED**: Low risk, standard due diligence sufficient"
+            f"\n- **ENHANCED DUE DILIGENCE**: Some concerns identified, additional review recommended"  
+            f"\n- **HIGH RISK**: Significant concerns, extensive documentation and approval required"
+            f"\n- **DO NOT PROCEED**: Critical risk factors present, avoid business relationship"
+            f"\n\nUse double line breaks between sections. Provide citations as numeric references like [1], [2] etc., within the text where applicable."
         )
         messages = [
             {
                 "role": "system",
-                "content": "You are an AI assistant performing company research. Provide an AML risk grade based *only* on specified negative keywords. Then summarize the company under the heading '## Company Summary'. For the '## Negative News Findings' section, organize information into clear categories like '### Financial Crimes', '### Regulatory Issues', '### Legal Proceedings', etc. Include dates, parties involved, and current status of each finding. Use numeric citations [1] and maintain clean formatting with proper section headers.",
+                "content": "You are an expert AML analyst performing company due diligence. Provide comprehensive analysis with clear company summary, risk assessment with organized categories, and specific recommendations. Use numeric citations [1] and maintain clean formatting with proper section headers.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -290,17 +499,26 @@ def search_with_perplexity(company_name, model="sonar-pro"):
         
         full_answer_content = None
         citations = []
-        aml_grade = None
+        recommendation = None
         if response.choices and len(response.choices) > 0:
             message = response.choices[0].message
             if message and message.content:
                 full_answer_content = message.content
-                match = re.match(r"AML Risk Grade: ([A-F])", full_answer_content, re.IGNORECASE)
-                if match:
-                    aml_grade = match.group(1).upper()
-                    full_answer_content = re.sub(r"AML Risk Grade: [A-F]\n*", "", full_answer_content, count=1, flags=re.IGNORECASE).strip()
-                else:
-                     logging.warning("Could not extract AML Grade.")
+                # Extract recommendation from the content
+                rec_patterns = [
+                    r"\*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*",
+                    r"Recommendation[:\s]*\*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*",
+                    r"- \*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*"
+                ]
+                
+                for pattern in rec_patterns:
+                    match = re.search(pattern, full_answer_content, re.IGNORECASE)
+                    if match:
+                        recommendation = match.group(1).upper()
+                        break
+                
+                if not recommendation:
+                    logging.warning("Could not extract recommendation from response.")
             # --- Citation Extraction (same as before) ---
             raw_citations = []
             # ... (check message.citations, response.citations) ...
@@ -329,11 +547,11 @@ def search_with_perplexity(company_name, model="sonar-pro"):
         if not full_answer_content:
             full_answer_content = "No summary could be generated by Perplexity."
             
-        return {"status": "success", "error": None, "answer": full_answer_content, "citations": citations, "aml_grade": aml_grade}
+        return {"status": "success", "error": None, "answer": full_answer_content, "citations": citations, "recommendation": recommendation}
 
     except Exception as e:
         logging.error(f"Error during Perplexity search for {company_name}: {str(e)}", exc_info=True)
-        return {"status": "failed", "error": str(e), "answer": None, "citations": [], "aml_grade": None}
+        return {"status": "failed", "error": str(e), "answer": None, "citations": [], "recommendation": None}
 
 def search_with_ofac(query):
     """Search OFAC sanctions database"""
@@ -372,8 +590,8 @@ def search_with_ofac(query):
             'ctl00$MainContent$lstPrograms': '',
             'ctl00$MainContent$ddlCountry': '',
             'ctl00$MainContent$ddlList': '',
-            'ctl00$MainContent$Slider1': '100',
-            'ctl00$MainContent$Slider1_Boundcontrol': '100',
+            'ctl00$MainContent$Slider1': '83',
+            'ctl00$MainContent$Slider1_Boundcontrol': '83',
             'ctl00$MainContent$btnSearch': 'Search',
             '__EVENTTARGET': 'ctl00$MainContent$btnSearch',
             '__EVENTARGUMENT': ''
@@ -428,14 +646,16 @@ def search_with_ofac(query):
                 results_count = int(count_match.group(1))
         
         if results_count == 0:
-            return "✅ No matches found in OFAC sanctions database - entity appears clean"
+            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective (minimum 83% match threshold).\n\n**Recommendation**: Proceed with standard due diligence protocols."
         
-        # Format the results
-        result_text = f"🚨 **SANCTIONS ALERT**: Found {results_count} matches in OFAC database\n\n"
+        # Format the results with better spacing and structure
+        result_text = f"🚨 **SANCTIONS ALERT**: Found {results_count} potential match{'es' if results_count > 1 else ''} in OFAC database\n"
+        result_text += f"*(Minimum match threshold: 83%)*\n\n"
         
         # Show first few results as examples
         shown_results = 0
         max_show = min(5, len(rows) - 1)  # Show up to 5 results, excluding header
+        high_confidence_matches = 0
         
         for i, row in enumerate(rows[1:], 1):  # Skip header row
             if shown_results >= max_show:
@@ -453,20 +673,36 @@ def search_with_ofac(query):
                 list_type = cells[4].get_text().strip()
                 score = cells[5].get_text().strip()
                 
-                result_text += f"**{i}. {name}**\n"
+                # Track high confidence matches
+                try:
+                    score_num = float(score.replace('%', ''))
+                    if score_num >= 95:
+                        high_confidence_matches += 1
+                except:
+                    pass
+                
+                result_text += f"**Match #{shown_results + 1}: {name}**\n"
+                result_text += f"• **Match Score**: {score}%\n"
                 if address:
-                    result_text += f"   📍 Address: {address}\n"
-                result_text += f"   🏢 Type: {entity_type}\n"
-                result_text += f"   📋 Programs: {programs}\n"
-                result_text += f"   📝 List: {list_type}\n"
-                result_text += f"   🎯 Match Score: {score}%\n\n"
+                    result_text += f"• **Address**: {address}\n"
+                result_text += f"• **Entity Type**: {entity_type}\n"
+                result_text += f"• **Programs**: {programs}\n"
+                result_text += f"• **List**: {list_type}\n"
+                result_text += f"\n"
                 
                 shown_results += 1
         
         if results_count > max_show:
-            result_text += f"... and {results_count - max_show} more matches\n\n"
+            result_text += f"*... and {results_count - max_show} additional match{'es' if results_count - max_show > 1 else ''}*\n\n"
         
-        result_text += "⚠️ **This entity appears on OFAC sanctions lists. Proceed with extreme caution.**"
+        # Add summary and recommendation
+        result_text += "---\n\n"
+        if high_confidence_matches > 0:
+            result_text += f"**Summary**: {high_confidence_matches} high-confidence match{'es' if high_confidence_matches > 1 else ''} (95%+) detected. Entity has strong similarity to sanctioned individuals/entities.\n\n"
+            result_text += "**Recommendation**: ⛔ **DO NOT PROCEED** - Conduct thorough manual review and legal consultation before any business relationship."
+        else:
+            result_text += f"**Summary**: {results_count} potential match{'es' if results_count > 1 else ''} found with 83%+ similarity. Manual review required to determine false positives.\n\n"
+            result_text += "**Recommendation**: ⚠️ **ENHANCED DUE DILIGENCE** - Manually verify each match and document decision rationale."
         
         return result_text
         
@@ -504,17 +740,15 @@ def generate_pdf_bytes(company_name, data, search_engine="Unknown"):
             logging.warning(f"Could not add logo: {logo_error}")
             # Continue without logo if there's an issue
 
-        # --- AML Grade (same styling logic) ---
-        aml_grade = data.get("aml_grade", "N/A")
-        grade_color = colors.grey
-        # ... (grade color assignment) ...
-        if aml_grade == 'A': grade_color = colors.darkgreen
-        elif aml_grade == 'B': grade_color = colors.green
-        elif aml_grade == 'C': grade_color = colors.orange
-        elif aml_grade == 'D': grade_color = colors.orangered
-        elif aml_grade == 'F': grade_color = colors.darkred
-        grade_style = ParagraphStyle(name='AMLGrade', parent=styles['h1'], fontSize=20, textColor=grade_color, alignment=TA_CENTER, spaceAfter=15)
-        story.append(Paragraph(f"AML Risk: {aml_grade}", grade_style))
+        # --- AML Recommendation ---
+        recommendation = data.get("recommendation", "N/A")
+        rec_color = colors.grey
+        if recommendation == 'PROCEED': rec_color = colors.darkgreen
+        elif recommendation == 'ENHANCED DUE DILIGENCE': rec_color = colors.orange
+        elif recommendation == 'HIGH RISK': rec_color = colors.orangered
+        elif recommendation == 'DO NOT PROCEED': rec_color = colors.darkred
+        rec_style = ParagraphStyle(name='AMLRecommendation', parent=styles['h1'], fontSize=16, textColor=rec_color, alignment=TA_CENTER, spaceAfter=15)
+        story.append(Paragraph(f"Recommendation: {recommendation}", rec_style))
 
         # --- Title (same styling logic) ---
         title_style = styles['h1']
@@ -536,39 +770,45 @@ def generate_pdf_bytes(company_name, data, search_engine="Unknown"):
         h3_style = ParagraphStyle(name='H3', parent=styles['h2'], fontSize=12, spaceBefore=8, spaceAfter=4)
         body_style = ParagraphStyle(name='BodyText', parent=styles['Normal'], spaceBefore=6, spaceAfter=6, leading=14, fontSize=10, alignment=TA_LEFT)
 
-        # Split content based on expected headings
-        # Pattern now looks for both ## and ### headings
-        parts = re.split(r'(^## .*$|^### .*$)', answer_text, flags=re.MULTILINE)
-        
-        # Filter out empty strings resulting from split
-        parts = [p.strip() for p in parts if p and p.strip()]
-
-        if len(parts) > 1: # If headings were found and split occurred
-            current_heading_level = None
-            for part in parts:
-                if part.startswith('## '):
-                    # Main heading (Company Summary or Negative News Findings)
-                    heading_text = part.replace('## ', '')
-                    current_heading_level = 2
-                    story.append(Spacer(1, 0.1*inch))
-                    story.append(Paragraph(heading_text, h2_style))
-                    story.append(Spacer(1, 0.05*inch))
-                elif part.startswith('### '):
-                    # Subheading (categories like Financial Crimes, etc.)
-                    heading_text = part.replace('### ', '')
-                    current_heading_level = 3
-                    story.append(Spacer(1, 0.1*inch))
-                    story.append(Paragraph(heading_text, h3_style))
-                    story.append(Spacer(1, 0.03*inch))
-                else:
-                    # This is the text content following a heading
-                    formatted_text = apply_inline_markdown(part)
-                    story.append(Paragraph(formatted_text, body_style))
+        # Check if this is an OFAC report (different structure)
+        if search_engine == "OFAC" or 'SANCTIONS ALERT' in answer_text or 'OFAC CLEAR' in answer_text:
+            # Handle OFAC reports with specialized formatting
+            format_ofac_for_pdf(answer_text, story, styles)
         else:
-            # Fallback: If headings weren't found, render the whole block
-            logging.warning(f"Could not find expected headings in response for {company_name}. Rendering as plain block.")
-            escaped_answer = answer_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            story.append(Paragraph(f'<pre>{escaped_answer}</pre>', body_style))
+            # Handle AI-generated reports with section headings
+            # Split content based on expected headings
+            # Pattern now looks for both ## and ### headings
+            parts = re.split(r'(^## .*$|^### .*$)', answer_text, flags=re.MULTILINE)
+            
+            # Filter out empty strings resulting from split
+            parts = [p.strip() for p in parts if p and p.strip()]
+
+            if len(parts) > 1: # If headings were found and split occurred
+                current_heading_level = None
+                for part in parts:
+                    if part.startswith('## '):
+                        # Main heading (Company Summary or Negative News Findings)
+                        heading_text = part.replace('## ', '')
+                        current_heading_level = 2
+                        story.append(Spacer(1, 0.1*inch))
+                        story.append(Paragraph(heading_text, h2_style))
+                        story.append(Spacer(1, 0.05*inch))
+                    elif part.startswith('### '):
+                        # Subheading (categories like Financial Crimes, etc.)
+                        heading_text = part.replace('### ', '')
+                        current_heading_level = 3
+                        story.append(Spacer(1, 0.1*inch))
+                        story.append(Paragraph(heading_text, h3_style))
+                        story.append(Spacer(1, 0.03*inch))
+                    else:
+                        # This is the text content following a heading
+                        formatted_text = apply_inline_markdown(part)
+                        story.append(Paragraph(formatted_text, body_style))
+            else:
+                # Fallback: If headings weren't found, render the whole block
+                logging.warning(f"Could not find expected headings in response for {company_name}. Rendering as plain block.")
+                formatted_text = apply_inline_markdown(answer_text)
+                story.append(Paragraph(formatted_text, body_style))
 
         story.append(Spacer(1, 0.2*inch))
 
@@ -654,7 +894,7 @@ You are an expert AML (Anti-Money Laundering) analyst conducting comprehensive d
 OFAC SANCTIONS SCREENING RESULTS:
 {ofac_summary}
 
-Based on the OFAC screening results above and your research, provide a comprehensive AML risk assessment covering:
+Based on the OFAC screening results above and your research, provide a comprehensive AML assessment with the following structure:
 
 ## Company Summary
 - Basic company information and business activities
@@ -665,7 +905,8 @@ Based on the OFAC screening results above and your research, provide a comprehen
 
 ### OFAC Sanctions Analysis
 - Incorporate the OFAC screening results above
-- If any OFAC matches with 80%+ similarity scores were found, this is a RED FLAG
+- If any OFAC matches with 95%+ similarity scores were found, this is a CRITICAL RED FLAG
+- If matches with 83-94% similarity were found, this requires enhanced verification
 - Explain the implications of any sanctions matches
 
 ### Negative News & Compliance Issues
@@ -689,15 +930,14 @@ Based on the OFAC screening results above and your research, provide a comprehen
 - Regulatory sanctions or penalties
 - Supervisory actions
 
-## Risk Grade Assignment
-Based on your analysis, assign ONE of these AML risk grades:
-- A: Low Risk (Clean entity, no significant red flags)
-- B: Low-Medium Risk (Minor concerns, manageable with standard controls)
-- C: Medium Risk (Some concerns, enhanced due diligence recommended)
-- D: High Risk (Significant concerns, extensive due diligence required)
-- F: Critical Risk (Sanctions matches, criminal activity, or severe red flags - DO NOT PROCEED)
+## Summary & Recommendation
+Based on your analysis, provide a clear recommendation using ONE of these categories:
+- **PROCEED**: Low risk, standard due diligence sufficient
+- **ENHANCED DUE DILIGENCE**: Some concerns identified, additional review recommended
+- **HIGH RISK**: Significant concerns, extensive documentation and approval required
+- **DO NOT PROCEED**: Critical risk factors present, avoid business relationship
 
-IMPORTANT: If OFAC matches with 80%+ similarity were found, the grade should be F regardless of other factors.
+IMPORTANT: If OFAC matches with 95%+ similarity were found, the recommendation should be DO NOT PROCEED regardless of other factors.
 
 Provide specific examples and cite your sources. Be thorough but concise.
 """
@@ -743,24 +983,23 @@ Provide specific examples and cite your sources. Be thorough but concise.
             'url': 'https://sanctionssearch.ofac.treas.gov/'
         })
         
-        # Extract AML grade from response
-        aml_grade = "N/A"
-        grade_patterns = [
-            r"(?:Risk Grade|AML Grade|Grade):\s*([A-F])",
-            r"Grade:\s*([A-F])",
-            r"Risk:\s*([A-F])",
-            r"\b([A-F]):\s*(?:Low|Medium|High|Critical)"
+        # Extract recommendation from response
+        recommendation = None
+        rec_patterns = [
+            r"\*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*",
+            r"Recommendation[:\s]*\*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*",
+            r"- \*\*(PROCEED|ENHANCED DUE DILIGENCE|HIGH RISK|DO NOT PROCEED)\*\*"
         ]
         
-        for pattern in grade_patterns:
+        for pattern in rec_patterns:
             match = re.search(pattern, answer, re.IGNORECASE)
             if match:
-                aml_grade = match.group(1).upper()
+                recommendation = match.group(1).upper()
                 break
         
-        # Override grade if high-risk sanctions found
+        # Override recommendation if high-risk sanctions found
         if high_risk_sanctions:
-            aml_grade = "F"
+            recommendation = "DO NOT PROCEED"
         
         # Append OFAC details to the answer
         full_answer = answer + "\n\n## OFAC Sanctions Screening Details\n\n" + ofac_result
@@ -770,7 +1009,7 @@ Provide specific examples and cite your sources. Be thorough but concise.
             "error": None,
             "answer": full_answer,
             "citations": citations,
-            "aml_grade": aml_grade
+            "recommendation": recommendation
         }
         
     except Exception as e:
@@ -780,7 +1019,7 @@ Provide specific examples and cite your sources. Be thorough but concise.
             "error": f"Comprehensive search failed: {str(e)}",
             "answer": None,
             "citations": [],
-            "aml_grade": None
+            "recommendation": None
         }
 
 # --- Streamlit App UI ---
@@ -879,7 +1118,7 @@ if line_count > 0:
             pdf_bytes = None
             status = "failed"
             error_message = "Processing not started."
-            aml_grade = None
+            recommendation = None
             save_location_message = ""
             
             with st.spinner(f"🔍 Analyzing {name}..."):
@@ -890,11 +1129,11 @@ if line_count > 0:
                         pdf_bytes = generate_pdf_bytes(name, result, "Comprehensive")
                         status = "success"
                         error_message = None
-                        aml_grade = result.get("aml_grade")
+                        recommendation = result.get("recommendation")
                     else:
                         status = "failed"
                         error_message = result["error"]
-                        aml_grade = None
+                        recommendation = None
                         pdf_bytes = None
                 
                 elif search_engine == "AI Research Only":
@@ -903,11 +1142,11 @@ if line_count > 0:
                         pdf_bytes = generate_pdf_bytes(name, result, "AI Research")
                         status = "success"
                         error_message = None
-                        aml_grade = result.get("aml_grade")
+                        recommendation = result.get("recommendation")
                     else:
                         status = "failed"
                         error_message = result["error"]
-                        aml_grade = None
+                        recommendation = None
                         pdf_bytes = None
                 
                 elif search_engine == "OFAC Sanctions Only":
@@ -915,16 +1154,16 @@ if line_count > 0:
                     if "❌" in ofac_result:
                         status = "failed"
                         error_message = ofac_result
-                        aml_grade = None
+                        recommendation = None
                         pdf_bytes = None
                     else:
                         status = "success"
                         error_message = None
                         if "🚨" in ofac_result or "SANCTIONS ALERT" in ofac_result:
-                            aml_grade = "F"
+                            recommendation = "DO NOT PROCEED"
                         else:
-                            aml_grade = "A"
-                        pdf_bytes = generate_pdf_bytes(name, {"answer": ofac_result, "aml_grade": aml_grade}, "OFAC")
+                            recommendation = "PROCEED"
+                        pdf_bytes = generate_pdf_bytes(name, {"answer": ofac_result, "recommendation": recommendation}, "OFAC")
                 
                 # Handle local saving
                 if status == "success" and pdf_bytes:
@@ -956,7 +1195,7 @@ if line_count > 0:
                 'status': status,
                 'error_message': error_message,
                 'pdf_bytes': pdf_bytes,
-                'aml_grade': aml_grade,
+                'recommendation': recommendation,
                 'save_location_message': save_location_message
             })
             
@@ -978,16 +1217,19 @@ if st.session_state.results_list:
     
     for result in st.session_state.results_list:
         with status_cols[current_status_col]:
-            grade = result.get('aml_grade', 'N/A')
+            recommendation = result.get('recommendation', 'N/A')
             save_msg = result.get('save_location_message', '')
             
+            # Get color for recommendation display
+            rec_color = get_recommendation_color(recommendation)
+            
             if result['status'] == 'success' and result.get('pdf_bytes') is None and save_msg:
-                st.success(f"✅ **{result['name']}** [Risk: {grade}] - {save_msg}")
+                st.success(f"✅ **{result['name']}** [{recommendation}] - {save_msg}")
             elif result['status'] == 'success' and result.get('pdf_bytes') is not None:
-                st.info(f"📄 **{result['name']}** [Risk: {grade}] - {save_msg}")
+                st.info(f"📄 **{result['name']}** [{recommendation}] - {save_msg}")
                 pdfs_for_zip.append(result)
             elif result['status'] == 'warning':
-                st.warning(f"⚠️ **{result['name']}** [Risk: {grade}] - {save_msg}")
+                st.warning(f"⚠️ **{result['name']}** [{recommendation}] - {save_msg}")
                 if result.get('pdf_bytes') is not None:
                     pdfs_for_zip.append(result)
             else:
@@ -1022,4 +1264,4 @@ if st.session_state.results_list:
 
 # Footer
 st.markdown("---")
-st.markdown("**AML Demo v1.19** | Powered by Perplexity AI & OFAC Database") 
+st.markdown("**AML Demo v1.20** | Powered by Perplexity AI & OFAC Database (83% match threshold)") 

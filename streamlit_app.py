@@ -13,6 +13,9 @@ import urllib3 # For suppressing SSL warnings
 import requests # For OFAC search
 from bs4 import BeautifulSoup # For parsing HTML results
 import urllib.parse # For URL encoding
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -38,7 +41,7 @@ st.set_page_config(
 )
 
 # Version number
-APP_VERSION = "1.20"
+APP_VERSION = "1.39"
 
 # Configure logging (optional for Streamlit, but can be helpful)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -404,6 +407,25 @@ def apply_inline_markdown(text):
 # --- Constants ---
 NEGATIVE_KEYWORDS = '(arrest OR bankruptcy OR BSA OR conviction OR criminal OR fraud OR trafficking OR lawsuit OR "money laundering" OR OFAC OR Ponzi OR terrorist OR violation OR "honorary consul" OR consul OR "Panama Papers" OR theft OR corruption OR bribery)'
 
+# Preferred domain list for enhanced searches
+PREFERRED_DOMAINS = [
+    "sec.gov",
+    "finra.org", 
+    "treasury.gov",
+    "oig.gov",
+    "cftc.gov",
+    "fdic.gov",
+    "federalreserve.gov",
+    "justice.gov",
+    "fbi.gov",
+    "fincen.gov",
+    "reuters.com",
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "law360.com"
+]
+
 # Perplexity Models
 PERPLEXITY_MODELS = {
     "sonar-pro": {
@@ -449,7 +471,7 @@ AXOS_LOGO_SVG = """
 
 # --- Core Functions (Adapted from Flask app) ---
 
-def search_with_perplexity(company_name, model="sonar-pro"):
+def search_with_perplexity(company_name, model="sonar-pro", domain_filter=None):
     # (This function remains largely the same as in app.py)
     # ... (API call logic, prompt, message structure) ...
     logging.info(f"Starting Perplexity search for company: {company_name} using model: {model}")
@@ -457,14 +479,30 @@ def search_with_perplexity(company_name, model="sonar-pro"):
         logging.error("OpenAI client (for Perplexity) not initialized.")
         return {"status": "failed", "error": "Perplexity API client not initialized.", "answer": None, "citations": [], "aml_grade": None}
     try:
+        # Build domain filter instruction with default authoritative domains
+        default_domains = [
+            "sec.gov", "www.icij.org", "finra.org", "treasury.gov", "oig.gov", "justice.gov", 
+            "fbi.gov", "fatf-gafi.org", "fincen.gov", "fdic.gov", "federalreserve.gov",
+            "occ.gov", "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "interpol.int"
+        ]
+        
+        domain_instruction = ""
+        if domain_filter and domain_filter.strip():
+            filtered_domains = [d.strip() for d in domain_filter.strip().split('\n') if d.strip()]
+            if filtered_domains:
+                domain_instruction = f"\n\nIMPORTANT: Focus your search primarily on these specific domains: {', '.join(filtered_domains)}. Also prioritize information from regulatory and financial news sources."
+        else:
+            # Use default authoritative domains when no specific filter is provided
+            domain_instruction = f"\n\nIMPORTANT: Prioritize information from authoritative regulatory and financial sources including: {', '.join(default_domains[:10])} and similar regulatory, law enforcement, and reputable financial news sources."
+        
         # Updated Prompt: Ask for explicit separation with headings
         prompt = (
-            f"Provide a comprehensive AML (Anti-Money Laundering) due diligence assessment for '{company_name}'. "
+            f"Provide a comprehensive AML (Anti-Money Laundering) due diligence assessment for '{company_name}'. {domain_instruction}"
             f"\n\nStructure your response as follows:"
-            f"\n\n## Company Summary"
-            f"\nProvide a brief summary of the company '{company_name}', including business activities, key executives, and geographic presence.\n"
+            f"\n\n## Subject Summary"
+            f"\nProvide a brief summary of the subject '{company_name}', including business activities, key executives, and geographic presence.\n"
             f"\n\n## AML Risk Assessment"
-            f"\nAnalyze any negative news found regarding this company, focusing on: {NEGATIVE_KEYWORDS}. "
+            f"\nAnalyze any negative news found regarding this subject, focusing on: {NEGATIVE_KEYWORDS}. "
             f"Organize findings into clear categories such as 'Financial Crimes', 'Regulatory Issues', 'Legal Proceedings', etc. "
             f"For each finding, include when it happened, key parties involved, and current status if available. "
             f"If no relevant negative news is found in a category, state that clearly.\n"
@@ -477,21 +515,38 @@ def search_with_perplexity(company_name, model="sonar-pro"):
             f"\n- **DO NOT PROCEED**: Critical risk factors present, avoid business relationship"
             f"\n\nUse double line breaks between sections. Provide citations as numeric references like [1], [2] etc., within the text where applicable."
         )
-        messages = [
-            {
-                "role": "system",
-                "content": "You are an expert AML analyst performing company due diligence. Provide comprehensive analysis with clear company summary, risk assessment with organized categories, and specific recommendations. Use numeric citations [1] and maintain clean formatting with proper section headers.",
-            },
-            {"role": "user", "content": prompt},
-        ]
+        # For Sonar models, system prompts are ignored - combine everything in user message
+        if "sonar" in model.lower():
+            full_prompt = f"As an expert AML analyst performing subject due diligence, provide comprehensive analysis with clear subject summary, risk assessment with organized categories, and specific recommendations. Use numeric citations [1] and maintain clean formatting with proper section headers.\n\n{prompt}"
+            messages = [
+                {"role": "user", "content": full_prompt}
+            ]
+        else:
+            # For other models, use system + user structure
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are an expert AML analyst performing subject due diligence. Provide comprehensive analysis with clear subject summary, risk assessment with organized categories, and specific recommendations. Use numeric citations [1] and maintain clean formatting with proper section headers.",
+                },
+                {"role": "user", "content": prompt},
+            ]
         
-        # Add reasoning_effort for deep research model
+        # Build API parameters based on model type
         api_params = {
             "model": model,
             "messages": messages,
-            "temperature": 0.1,
             "max_tokens": 4000 if model == "sonar-deep-research" else 2000
         }
+        
+        # Only add temperature for non-Sonar models (real-time search models don't use temperature)
+        if "sonar" not in model.lower():
+            api_params["temperature"] = 0.1
+        
+        # Add web search options for Sonar models (high context for comprehensive AML research)
+        if "sonar" in model.lower():
+            api_params["web_search_options"] = {
+                "search_context_size": "high"  # Use high context for deep research and comprehensive citations
+            }
         
         logging.info(f"Calling Perplexity API (model: {model})...")
         response = openai_client.chat.completions.create(**api_params)
@@ -648,21 +703,20 @@ def search_with_ofac(query):
         if results_count == 0:
             return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective (minimum 83% match threshold).\n\n**Recommendation**: Proceed with standard due diligence protocols."
         
-        # Format the results with better spacing and structure
-        result_text = f"🚨 **SANCTIONS ALERT**: Found {results_count} potential match{'es' if results_count > 1 else ''} in OFAC database\n"
-        result_text += f"*(Minimum match threshold: 83%)*\n\n"
-        
-        # Show first few results as examples
-        shown_results = 0
-        max_show = min(5, len(rows) - 1)  # Show up to 5 results, excluding header
+        # Initialize variables at the start
+        all_matches = []
         high_confidence_matches = 0
         
-        for i, row in enumerate(rows[1:], 1):  # Skip header row
-            if shown_results >= max_show:
-                break
-                
+        # Process ALL rows - OFAC table has no header row to skip
+        for i, row in enumerate(rows, 1):
             cells = row.find_all('td')
-            if len(cells) >= 6:
+            
+            # Must have at least 6 cells for a valid data row
+            if len(cells) < 6:
+                continue
+                
+            try:
+                # Extract all cell data
                 name_cell = cells[0]
                 name_link = name_cell.find('a')
                 name = name_link.get_text().strip() if name_link else name_cell.get_text().strip()
@@ -673,27 +727,61 @@ def search_with_ofac(query):
                 list_type = cells[4].get_text().strip()
                 score = cells[5].get_text().strip()
                 
+                # Parse score - handle both "100%" and "100" formats
+                score_num = 0
+                if score:
+                    try:
+                        score_clean = score.replace('%', '').strip()
+                        score_num = float(score_clean)
+                    except:
+                        continue
+                else:
+                    continue
+                
+                # Apply 83% threshold
+                if score_num < 83:
+                    continue
+
                 # Track high confidence matches
-                try:
-                    score_num = float(score.replace('%', ''))
-                    if score_num >= 95:
-                        high_confidence_matches += 1
-                except:
-                    pass
+                if score_num >= 95:
+                    high_confidence_matches += 1
                 
-                result_text += f"**Match #{shown_results + 1}: {name}**\n"
-                result_text += f"• **Match Score**: {score}%\n"
-                if address:
-                    result_text += f"• **Address**: {address}\n"
-                result_text += f"• **Entity Type**: {entity_type}\n"
-                result_text += f"• **Programs**: {programs}\n"
-                result_text += f"• **List**: {list_type}\n"
-                result_text += f"\n"
+                # Store match info
+                score_display = f"{score_num}%" if not score.endswith('%') else score
+                all_matches.append({
+                    'name': name,
+                    'address': address,
+                    'entity_type': entity_type,
+                    'programs': programs,
+                    'list_type': list_type,
+                    'score': score_display,
+                    'score_num': score_num
+                })
                 
-                shown_results += 1
+            except Exception as e:
+                continue
         
-        if results_count > max_show:
-            result_text += f"*... and {results_count - max_show} additional match{'es' if results_count - max_show > 1 else ''}*\n\n"
+        # Check if no matches found
+        if len(all_matches) == 0:
+            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective (minimum 83% match threshold).\n\n**Recommendation**: Proceed with standard due diligence protocols."
+        
+        # Sort matches by score (highest first)
+        all_matches.sort(key=lambda x: x['score_num'], reverse=True)
+        
+        # Format the results
+        result_text = f"🚨 **SANCTIONS ALERT**: Found {len(all_matches)} match{'es' if len(all_matches) > 1 else ''} in OFAC database\n"
+        result_text += f"*(Minimum match threshold: 83%)*\n\n"
+        
+        # Display all matches
+        for i, match in enumerate(all_matches):
+            result_text += f"**Match #{i + 1}: {match['name']}**\n"
+            result_text += f"• **Match Score**: {match['score']}\n"
+            if match['address']:
+                result_text += f"• **Address**: {match['address']}\n"
+            result_text += f"• **Entity Type**: {match['entity_type']}\n"
+            result_text += f"• **Programs**: {match['programs']}\n"
+            result_text += f"• **List**: {match['list_type']}\n"
+            result_text += f"\n"
         
         # Add summary and recommendation
         result_text += "---\n\n"
@@ -701,8 +789,14 @@ def search_with_ofac(query):
             result_text += f"**Summary**: {high_confidence_matches} high-confidence match{'es' if high_confidence_matches > 1 else ''} (95%+) detected. Entity has strong similarity to sanctioned individuals/entities.\n\n"
             result_text += "**Recommendation**: ⛔ **DO NOT PROCEED** - Conduct thorough manual review and legal consultation before any business relationship."
         else:
-            result_text += f"**Summary**: {results_count} potential match{'es' if results_count > 1 else ''} found with 83%+ similarity. Manual review required to determine false positives.\n\n"
+            result_text += f"**Summary**: {len(all_matches)} potential match{'es' if len(all_matches) > 1 else ''} found with 83%+ similarity. Manual review required to determine false positives.\n\n"
             result_text += "**Recommendation**: ⚠️ **ENHANCED DUE DILIGENCE** - Manually verify each match and document decision rationale."
+        
+        # Add direct search URL
+        import urllib.parse
+        encoded_query = urllib.parse.quote(query)
+        direct_url = f"https://sanctionssearch.ofac.treas.gov/?search={encoded_query}"
+        result_text += f"\n\n**Direct OFAC Search URL**: {direct_url}"
         
         return result_text
         
@@ -754,7 +848,7 @@ def generate_pdf_bytes(company_name, data, search_engine="Unknown"):
         title_style = styles['h1']
         title_style.alignment = TA_CENTER
         title_style.fontSize = 18
-        story.append(Paragraph(f"Research Report: {company_name}", title_style))
+        story.append(Paragraph(f"Subject Report: {company_name}", title_style))
         story.append(Spacer(1, 0.2*inch))
         
         # --- Search Engine Info ---
@@ -787,7 +881,7 @@ def generate_pdf_bytes(company_name, data, search_engine="Unknown"):
                 current_heading_level = None
                 for part in parts:
                     if part.startswith('## '):
-                        # Main heading (Company Summary or Negative News Findings)
+                        # Main heading (Subject Summary or Negative News Findings)
                         heading_text = part.replace('## ', '')
                         current_heading_level = 2
                         story.append(Spacer(1, 0.1*inch))
@@ -854,7 +948,7 @@ def generate_pdf_bytes(company_name, data, search_engine="Unknown"):
         logging.error(f"Error generating PDF bytes for {company_name}: {pdf_error}", exc_info=True)
         return None
 
-def search_with_comprehensive(company_name, model="sonar-pro"):
+def search_with_comprehensive(company_name, model="sonar-pro", domain_filter=None):
     """Comprehensive search combining Perplexity AI research with OFAC sanctions screening"""
     try:
         # First, perform OFAC sanctions search
@@ -887,17 +981,33 @@ def search_with_comprehensive(company_name, model="sonar-pro"):
         # Now perform Perplexity search with OFAC context
         logging.info(f"Starting comprehensive search for {company_name} - Perplexity phase using {model}")
         
+        # Build domain filter instruction for comprehensive search with default authoritative domains
+        default_domains = [
+            "sec.gov", "finra.org", "treasury.gov", "oig.gov", "justice.gov", 
+            "fbi.gov", "fatf-gafi.org", "fincen.gov", "fdic.gov", "federalreserve.gov",
+            "occ.gov", "reuters.com", "bloomberg.com", "wsj.com", "ft.com"
+        ]
+        
+        domain_instruction = ""
+        if domain_filter and domain_filter.strip():
+            filtered_domains = [d.strip() for d in domain_filter.strip().split('\n') if d.strip()]
+            if filtered_domains:
+                domain_instruction = f"\n\nIMPORTANT: Focus your search primarily on these specific domains: {', '.join(filtered_domains)}. Also prioritize information from regulatory and financial news sources."
+        else:
+            # Use default authoritative domains when no specific filter is provided
+            domain_instruction = f"\n\nIMPORTANT: Prioritize information from authoritative regulatory and financial sources including: {', '.join(default_domains[:10])} and similar regulatory, law enforcement, and reputable financial news sources."
+        
         # Enhanced prompt that includes OFAC context
         enhanced_prompt = f"""
-You are an expert AML (Anti-Money Laundering) analyst conducting comprehensive due diligence research on "{company_name}".
+You are an expert AML (Anti-Money Laundering) analyst conducting comprehensive due diligence research on "{company_name}".{domain_instruction}
 
 OFAC SANCTIONS SCREENING RESULTS:
 {ofac_summary}
 
 Based on the OFAC screening results above and your research, provide a comprehensive AML assessment with the following structure:
 
-## Company Summary
-- Basic company information and business activities
+## Subject Summary
+- Basic subject information and business activities
 - Key executives and ownership structure
 - Geographic presence and operations
 
@@ -942,19 +1052,30 @@ IMPORTANT: If OFAC matches with 95%+ similarity were found, the recommendation s
 Provide specific examples and cite your sources. Be thorough but concise.
 """
 
-        # Call Perplexity with enhanced prompt
-        messages = [
-            {"role": "system", "content": "You are an expert AML analyst. Provide thorough, factual analysis with proper citations."},
-            {"role": "user", "content": enhanced_prompt}
-        ]
+        # Call Perplexity with enhanced prompt using optimized parameters
+        # For Sonar models, system prompts are ignored - combine everything in user message
+        if "sonar" in model.lower():
+            full_prompt = f"As an expert AML analyst, provide thorough, factual analysis with proper citations.\n\n{enhanced_prompt}"
+            messages = [
+                {"role": "user", "content": full_prompt}
+            ]
+        else:
+            # For other models, use system + user structure
+            messages = [
+                {"role": "system", "content": "You are an expert AML analyst. Provide thorough, factual analysis with proper citations."},
+                {"role": "user", "content": enhanced_prompt}
+            ]
         
-        # Add reasoning_effort for deep research model
+        # Build API parameters based on model type
         api_params = {
             "model": model,
             "messages": messages,
-            "temperature": 0.1,
             "max_tokens": 4000 if model == "sonar-deep-research" else 2000
         }
+        
+        # Only add temperature for non-Sonar models (real-time search models don't use temperature)
+        if "sonar" not in model.lower():
+            api_params["temperature"] = 0.1
         
         logging.info(f"Calling Perplexity API (model: {model})...")
         response = openai_client.chat.completions.create(**api_params)
@@ -977,10 +1098,19 @@ Provide specific examples and cite your sources. Be thorough but concise.
                         'url': citation
                     })
         
-        # Add OFAC as a citation
+        # Add OFAC as a citation with direct search URL
         citations.append({
             'title': 'OFAC Sanctions List Search',
             'url': 'https://sanctionssearch.ofac.treas.gov/'
+        })
+        
+        # Add direct search URL for specific query
+        import urllib.parse
+        encoded_query = urllib.parse.quote(company_name)
+        search_url = f"https://sanctionssearch.ofac.treas.gov/?search={encoded_query}"
+        citations.append({
+            'title': f'Direct OFAC Search Results for "{company_name}"',
+            'url': search_url
         })
         
         # Extract recommendation from response
@@ -1022,6 +1152,240 @@ Provide specific examples and cite your sources. Be thorough but concise.
             "recommendation": None
         }
 
+def generate_word_document(results_data):
+    """Generate a single Word document containing all subjects with summary table and detailed sections"""
+    
+    # Create new document
+    doc = Document()
+    
+    # Add title
+    title = doc.add_heading('AML Due Diligence Report', 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Add generation date
+    date_para = doc.add_paragraph(f'Generated: {datetime.now().strftime("%B %d, %Y")}')
+    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    doc.add_paragraph()  # Empty line
+    
+    # Create summary table
+    table = doc.add_table(rows=1, cols=3)
+    table.style = 'Table Grid'
+    table.autofit = False
+    
+    # Set column widths
+    table.columns[0].width = Inches(2.5)  # Name
+    table.columns[1].width = Inches(2.0)  # CLEAR  
+    table.columns[2].width = Inches(2.0)  # Internet Search
+    
+    # Add header row
+    header_cells = table.rows[0].cells
+    header_cells[0].text = 'Name'
+    header_cells[1].text = 'CLEAR'
+    header_cells[2].text = 'Internet Search'
+    
+    # Format header row
+    for cell in header_cells:
+        cell.paragraphs[0].runs[0].bold = True
+        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Add data rows
+    for result in results_data:
+        if result['status'] == 'success':
+            row_cells = table.add_row().cells
+            row_cells[0].text = result['name']
+            
+            # Determine CLEAR status based on recommendation
+            recommendation = result.get('recommendation', 'N/A')
+            if recommendation == 'PROCEED':
+                clear_status = 'N/A (always the same)'
+            elif recommendation == 'DO NOT PROCEED':
+                clear_status = 'N/A'
+            else:
+                clear_status = 'N/A'
+            
+            row_cells[1].text = clear_status
+            
+            # Determine Internet Search status
+            if recommendation == 'PROCEED':
+                internet_search = 'No negative findings'
+            elif recommendation in ['ENHANCED DUE DILIGENCE', 'HIGH RISK', 'DO NOT PROCEED']:
+                internet_search = 'See below'
+            else:
+                internet_search = 'No negative findings'
+                
+            row_cells[2].text = internet_search
+            
+            # Center align all cells
+            for cell in row_cells:
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    doc.add_paragraph()  # Empty line after table
+    
+    # Add detailed sections for each subject
+    for i, result in enumerate(results_data):
+        if result['status'] == 'success':
+            # Add subject heading as H1 - large and noticeable
+            heading = doc.add_heading(f'{result["name"]} Due Diligence Summary:', level=1)
+            
+            # Extract and format the answer content
+            answer = result.get('answer', '')
+            recommendation = result.get('recommendation', 'N/A')
+            
+            # Add the complete answer content with improved header formatting
+            if answer and answer.strip():
+                # Check if this is a minimal response that qualifies for standardized language
+                answer_lower = answer.lower()
+                is_minimal_response = (
+                    len(answer.strip()) < 200 or  # Very short response
+                    'no summary could be generated' in answer_lower or
+                    'no content available' in answer_lower or
+                    'no information found' in answer_lower or
+                    'ofac clear' in answer_lower and 'no matches found' in answer_lower
+                )
+                
+                # Check for different types of "no findings" scenarios
+                has_general_info = any(keyword in answer_lower for keyword in [
+                    'company', 'corporation', 'business', 'founded', 'established', 'industry',
+                    'headquarters', 'operations', 'subsidiaries', 'revenue', 'employees',
+                    'products', 'services', 'market', 'sector', 'chairman', 'ceo', 'executive'
+                ])
+                
+                has_negative_findings = any(keyword in answer_lower for keyword in [
+                    'violation', 'fine', 'penalty', 'investigation', 'fraud', 'criminal',
+                    'money laundering', 'sanctions', 'enforcement', 'lawsuit', 'litigation',
+                    'regulatory action', 'compliance issues', 'misconduct', 'suspicious'
+                ])
+                
+                # Apply standardized language for no findings scenarios
+                if is_minimal_response and not has_general_info and not has_negative_findings:
+                    # No general or negative information found
+                    doc.add_paragraph("This search yielded no general background information on the subject.")
+                    doc.add_paragraph("This search yielded no findings that associate the subject with financial crimes or negative news.")
+                elif not has_negative_findings and has_general_info:
+                    # Has general info but no negative findings
+                    # Process content normally, then add negative findings statement
+                    content_processed = False
+                else:
+                    # Process content normally - has findings to display
+                    content_processed = False
+                
+                # If we need to process content normally (not minimal response or has findings)
+                if not is_minimal_response or has_general_info or has_negative_findings:
+                    # Process content line by line to handle different header levels
+                    lines = answer.split('\n')
+                    current_paragraph = []
+                    
+                    for line in lines:
+                        line_stripped = line.strip()
+                        
+                        # Handle different markdown header levels
+                        if line_stripped.startswith('### '):
+                            # Process any accumulated paragraph content
+                            if current_paragraph:
+                                para_text = '\n'.join(current_paragraph).strip()
+                                if para_text:
+                                    # Remove markdown formatting
+                                    para_text = para_text.replace('**', '').replace('*', '')
+                                    doc.add_paragraph(para_text)
+                                current_paragraph = []
+                            
+                            # Add H3 heading
+                            header_text = line_stripped[4:].strip()
+                            doc.add_heading(header_text, level=3)
+                            
+                        elif line_stripped.startswith('## '):
+                            # Process any accumulated paragraph content
+                            if current_paragraph:
+                                para_text = '\n'.join(current_paragraph).strip()
+                                if para_text:
+                                    # Remove markdown formatting
+                                    para_text = para_text.replace('**', '').replace('*', '')
+                                    doc.add_paragraph(para_text)
+                                current_paragraph = []
+                            
+                            # Add H2 heading
+                            header_text = line_stripped[3:].strip()
+                            doc.add_heading(header_text, level=2)
+                            
+                        elif line_stripped.startswith('# '):
+                            # Process any accumulated paragraph content
+                            if current_paragraph:
+                                para_text = '\n'.join(current_paragraph).strip()
+                                if para_text:
+                                    # Remove markdown formatting
+                                    para_text = para_text.replace('**', '').replace('*', '')
+                                    doc.add_paragraph(para_text)
+                                current_paragraph = []
+                            
+                            # Add H3 heading for single # (make it bold and larger)
+                            header_text = line_stripped[2:].strip()
+                            heading_para = doc.add_paragraph()
+                            heading_run = heading_para.add_run(header_text)
+                            heading_run.bold = True
+                            heading_run.font.size = Pt(14)  # Larger than normal text
+                            
+                        elif line_stripped == '':
+                            # Empty line - if we have accumulated content, add paragraph and start new one
+                            if current_paragraph:
+                                para_text = '\n'.join(current_paragraph).strip()
+                                if para_text:
+                                    # Remove markdown formatting
+                                    para_text = para_text.replace('**', '').replace('*', '')
+                                    doc.add_paragraph(para_text)
+                                current_paragraph = []
+                                
+                        else:
+                            # Regular content line
+                            current_paragraph.append(line)
+                    
+                    # Process any remaining paragraph content
+                    if current_paragraph:
+                        para_text = '\n'.join(current_paragraph).strip()
+                        if para_text:
+                            # Remove markdown formatting
+                            para_text = para_text.replace('**', '').replace('*', '')
+                            doc.add_paragraph(para_text)
+                    
+                    # Add standardized language for negative findings if needed
+                    if has_general_info and not has_negative_findings:
+                        doc.add_paragraph()  # Add space
+                        doc.add_paragraph("This search yielded no findings that associate the subject with financial crimes or negative news.")
+                        
+            else:
+                # No answer content at all - apply both standardized messages
+                doc.add_paragraph("This search yielded no general background information on the subject.")
+                doc.add_paragraph("This search yielded no findings that associate the subject with financial crimes or negative news.")
+            
+            doc.add_paragraph()  # Empty line
+            
+            # Add sources section
+            sources_para = doc.add_paragraph()
+            sources_para.add_run('[Sources]').bold = True
+            
+            # Add citations if available
+            citations = result.get('citations', [])
+            if citations:
+                for j, citation in enumerate(citations, 1):
+                    title = citation.get('title', 'Unknown Source')
+                    url = citation.get('url', '#')
+                    doc.add_paragraph(f"{j}. {title}")
+                    if url != '#':
+                        doc.add_paragraph(f"   URL: {url}")
+            else:
+                doc.add_paragraph("No specific sources cited.")
+            
+            # Add spacing between subjects
+            if i < len(results_data) - 1:
+                doc.add_paragraph()
+                doc.add_paragraph()
+    
+    # Save to bytes buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 # --- Streamlit App UI ---
 st.title("🏦 Axos Bank AML Research Platform")
 st.markdown("**Advanced Anti-Money Laundering Due Diligence System**")
@@ -1060,45 +1424,74 @@ if ("AI" in search_engine or "Comprehensive" in search_engine) and not openai_cl
 st.markdown("---")
 
 # Main input section
-st.markdown("### 📋 **Company Research Queue**")
+st.markdown("### 📋 **Subject Research Queue**")
 company_names_input = st.text_area(
-    "Enter company names (one per line)",
-    height=120,
-    placeholder="Example:\nGazprom\nAxos Financial\nMicrosoft\nShell Company Ltd",
-    help="Add companies you want to research. Each company will get a detailed AML report."
+    "**Subject Names** (one per line)",
+    height=150,
+    placeholder="Example:\nGazprom\nAxos Financial\nMicrosoft\nJohn Smith\nShell Company Ltd",
+    key="company_names"
 )
 
-# Show company count
+# Show subject count
 if company_names_input:
     lines = [line.strip() for line in company_names_input.split('\n') if line.strip()]
     line_count = len(lines)
-    if line_count > 0:
-        st.success(f"✅ {line_count} companies queued for analysis")
+    if line_count == 1:
+        st.caption(f"📝 {line_count} subject entered")
+    else:
+        st.caption(f"📝 {line_count} subjects entered")
 else:
     line_count = 0
-    st.info("👆 Enter company names above to begin")
+    st.info("👆 Enter subject names above to begin")
 
-# Optional local save path
-with st.expander("⚙️ **Advanced Options**", expanded=False):
-    destination_path_input = st.text_input(
-        "Local Save Path (Optional)", 
-        placeholder="C:\\Reports or /Users/name/Reports",
-        help="Save PDFs directly to this folder when running locally"
+# Output format selection
+st.markdown("### 📄 **Output Format**")
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    output_format = st.radio(
+        "Choose output format:",
+        ["Individual PDF Reports", "Single Word Document"],
+        index=0,
+        help="PDF: Individual reports for each subject | Word: Single document with summary table + detailed sections"
     )
-    if destination_path_input:
-        st.caption("📁 PDFs will be saved locally if path is valid, otherwise downloaded as ZIP")
+
+with col2:
+    if output_format == "Individual PDF Reports":
+        destination_path_input = st.text_input(
+            "Local Save Path (Optional)", 
+            placeholder="C:\\Reports or /Users/name/Reports",
+            help="Save PDFs directly to this folder when running locally"
+        )
+        if destination_path_input:
+            st.caption("📁 PDFs will be saved locally if path is valid, otherwise downloaded as ZIP")
+    else:
+        st.info("📄 Word document will be generated for download")
+        destination_path_input = ""  # Not used for Word docs
+
+# Domain filtering (always visible now)
+domain_filter = st.text_area(
+    "**Domain Filter** (Optional)",
+    placeholder="sec.gov\nfinra.org\ntreasury.gov\noig.gov",
+    height=80,
+    help="Enter specific domains to search (one per line). Leave empty for general web search."
+)
 
 st.markdown("---")
 
 # Generate Reports Button
 if line_count > 0:
     if st.button("🚀 **Generate AML Reports**", type="primary"):
-        company_names = [name.strip() for name in company_names_input.split('\n') if name.strip()]
+        subject_names = [name.strip() for name in company_names_input.split('\n') if name.strip()]
         destination_path = destination_path_input.strip()
+        domain_filter = domain_filter.strip() if domain_filter else None
         
-        # Validate destination path if provided
+        # Store output format in session state for later use
+        st.session_state.output_format = output_format
+        
+        # Validate destination path if provided (only for PDF mode)
         save_locally = False
-        if destination_path:
+        if destination_path and output_format == "Individual PDF Reports":
             if os.path.isdir(destination_path):
                 save_locally = True
                 st.success(f"📁 Reports will be saved to: {destination_path}")
@@ -1108,46 +1501,62 @@ if line_count > 0:
         
         # Show processing info
         model_name = PERPLEXITY_MODELS.get(selected_model, {}).get("name", selected_model) if "AI" in search_engine or "Comprehensive" in search_engine else "N/A"
-        st.info(f"🔄 Processing {len(company_names)} companies using **{search_engine}** {f'with **{model_name}**' if model_name != 'N/A' else ''}")
+        
+        # Show domain filter info if specified
+        filter_info = ""
+        if domain_filter and ("AI" in search_engine or "Comprehensive" in search_engine):
+            filtered_domains = [d.strip() for d in domain_filter.split('\n') if d.strip()]
+            if filtered_domains:
+                filter_info = f" (Domain-filtered: {len(filtered_domains)} domains)"
+        
+        # Show generation mode
+        generation_mode = "Word Document" if output_format == "Single Word Document" else "PDF Reports"
+        st.info(f"🔄 Processing {len(subject_names)} subjects using **{search_engine}** {f'with **{model_name}**' if model_name != 'N/A' else ''}{filter_info} → {generation_mode}")
         
         st.session_state.results_list = []
         progress_bar = st.progress(0)
-        total_names = len(company_names)
+        total_names = len(subject_names)
 
-        for i, name in enumerate(company_names):
+        for i, name in enumerate(subject_names):
             pdf_bytes = None
             status = "failed"
             error_message = "Processing not started."
             recommendation = None
             save_location_message = ""
+            answer = ""
+            citations = []
             
             with st.spinner(f"🔍 Analyzing {name}..."):
-                # Perform search based on selected engine
+                # Perform search based on selected engine - SAME FOR BOTH FORMATS
                 if search_engine == "Comprehensive (AI + OFAC)":
-                    result = search_with_comprehensive(name, selected_model)
+                    result = search_with_comprehensive(name, selected_model, domain_filter)
                     if result["status"] == "success":
-                        pdf_bytes = generate_pdf_bytes(name, result, "Comprehensive")
                         status = "success"
                         error_message = None
                         recommendation = result.get("recommendation")
+                        answer = result.get("answer", "")
+                        citations = result.get("citations", [])
                     else:
                         status = "failed"
                         error_message = result["error"]
                         recommendation = None
-                        pdf_bytes = None
+                        answer = ""
+                        citations = []
                 
                 elif search_engine == "AI Research Only":
-                    result = search_with_perplexity(name, selected_model)
+                    result = search_with_perplexity(name, selected_model, domain_filter)
                     if result["status"] == "success":
-                        pdf_bytes = generate_pdf_bytes(name, result, "AI Research")
                         status = "success"
                         error_message = None
                         recommendation = result.get("recommendation")
+                        answer = result.get("answer", "")
+                        citations = result.get("citations", [])
                     else:
                         status = "failed"
                         error_message = result["error"]
                         recommendation = None
-                        pdf_bytes = None
+                        answer = ""
+                        citations = []
                 
                 elif search_engine == "OFAC Sanctions Only":
                     ofac_result = search_with_ofac(name)
@@ -1155,22 +1564,33 @@ if line_count > 0:
                         status = "failed"
                         error_message = ofac_result
                         recommendation = None
-                        pdf_bytes = None
+                        answer = ""
+                        citations = []
                     else:
                         status = "success"
                         error_message = None
+                        answer = ofac_result
+                        citations = [{'title': 'OFAC Sanctions Database', 'url': 'https://sanctionssearch.ofac.treas.gov/'}]
                         if "🚨" in ofac_result or "SANCTIONS ALERT" in ofac_result:
                             recommendation = "DO NOT PROCEED"
                         else:
                             recommendation = "PROCEED"
+                
+                # Generate PDF only if PDF format is selected AND search was successful
+                if output_format == "Individual PDF Reports" and status == "success":
+                    if search_engine == "Comprehensive (AI + OFAC)":
+                        pdf_bytes = generate_pdf_bytes(name, result, "Comprehensive")
+                    elif search_engine == "AI Research Only":
+                        pdf_bytes = generate_pdf_bytes(name, result, "AI Research")
+                    elif search_engine == "OFAC Sanctions Only":
                         pdf_bytes = generate_pdf_bytes(name, {"answer": ofac_result, "recommendation": recommendation}, "OFAC")
                 
-                # Handle local saving
-                if status == "success" and pdf_bytes:
+                # Handle local saving for PDFs only
+                if output_format == "Individual PDF Reports" and status == "success" and pdf_bytes:
                     if save_locally and destination_path:
-                        safe_company_name = "".join(c if c.isalnum() else '_' for c in name)
+                        safe_subject_name = "".join(c if c.isalnum() else '_' for c in name)
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        pdf_filename = f"{safe_company_name}_{timestamp}.pdf"
+                        pdf_filename = f"{safe_subject_name}_{timestamp}.pdf"
                         filepath = os.path.join(destination_path, pdf_filename)
                         try:
                             with open(filepath, 'wb') as f:
@@ -1187,6 +1607,8 @@ if line_count > 0:
                         save_location_message = "Ready for ZIP download"
                     else:
                         save_location_message = "PDF generation failed"
+                elif output_format == "Single Word Document" and status == "success":
+                    save_location_message = "Ready for Word document"
                 else:
                     save_location_message = "Processing failed"
             
@@ -1196,7 +1618,9 @@ if line_count > 0:
                 'error_message': error_message,
                 'pdf_bytes': pdf_bytes,
                 'recommendation': recommendation,
-                'save_location_message': save_location_message
+                'save_location_message': save_location_message,
+                'answer': answer,
+                'citations': citations
             })
             
             progress_bar.progress((i + 1) / total_names)
@@ -1204,64 +1628,102 @@ if line_count > 0:
         st.success("✅ **Processing Complete!**")
         progress_bar.empty()
 else:
-    st.button("🚀 **Generate AML Reports**", disabled=True, help="Enter company names first")
+    st.button("🚀 **Generate AML Reports**", disabled=True, help="Enter subject names first")
 
 # --- Display Results Status ---
 if st.session_state.results_list:
     st.markdown("---")
     st.markdown("### 📊 **Processing Results**")
     
-    pdfs_for_zip = []
-    status_cols = st.columns(2)
-    current_status_col = 0
+    # Check if Word document was requested using session state
+    word_doc_requested = getattr(st.session_state, 'output_format', 'Individual PDF Reports') == "Single Word Document"
     
-    for result in st.session_state.results_list:
-        with status_cols[current_status_col]:
-            recommendation = result.get('recommendation', 'N/A')
-            save_msg = result.get('save_location_message', '')
+    if word_doc_requested:
+        # Word document mode - show summary and generate single document
+        successful_results = [res for res in st.session_state.results_list if res['status'] == 'success']
+        failed_results = [res for res in st.session_state.results_list if res['status'] != 'success']
+        
+        if successful_results:
+            st.success(f"✅ {len(successful_results)} subjects processed successfully")
+        if failed_results:
+            st.error(f"❌ {len(failed_results)} subjects failed")
+            for result in failed_results:
+                st.error(f"• **{result['name']}**: {result.get('error_message', 'Unknown error')}")
+        
+        # Generate and offer Word document download
+        if successful_results:
+            st.markdown("---")
+            st.markdown("### 📄 **Download Word Document**")
             
-            # Get color for recommendation display
-            rec_color = get_recommendation_color(recommendation)
-            
-            if result['status'] == 'success' and result.get('pdf_bytes') is None and save_msg:
-                st.success(f"✅ **{result['name']}** [{recommendation}] - {save_msg}")
-            elif result['status'] == 'success' and result.get('pdf_bytes') is not None:
-                st.info(f"📄 **{result['name']}** [{recommendation}] - {save_msg}")
-                pdfs_for_zip.append(result)
-            elif result['status'] == 'warning':
-                st.warning(f"⚠️ **{result['name']}** [{recommendation}] - {save_msg}")
-                if result.get('pdf_bytes') is not None:
+            try:
+                word_bytes = generate_word_document(successful_results)
+                
+                st.download_button(
+                    label="📥 **Download AML Due Diligence Report (Word)**",
+                    data=word_bytes,
+                    file_name=f"AML_Due_Diligence_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary"
+                )
+                
+                st.info(f"📋 Document contains summary table and detailed sections for {len(successful_results)} subjects")
+                
+            except Exception as e:
+                st.error(f"❌ Error generating Word document: {str(e)}")
+                
+    else:
+        # PDF mode - existing logic
+        pdfs_for_zip = []
+        status_cols = st.columns(2)
+        current_status_col = 0
+        
+        for result in st.session_state.results_list:
+            with status_cols[current_status_col]:
+                recommendation = result.get('recommendation', 'N/A')
+                save_msg = result.get('save_location_message', '')
+                
+                # Get color for recommendation display
+                rec_color = get_recommendation_color(recommendation)
+                
+                if result['status'] == 'success' and result.get('pdf_bytes') is None and save_msg:
+                    st.success(f"✅ **{result['name']}** [{recommendation}] - {save_msg}")
+                elif result['status'] == 'success' and result.get('pdf_bytes') is not None:
+                    st.info(f"📄 **{result['name']}** [{recommendation}] - {save_msg}")
                     pdfs_for_zip.append(result)
-            else:
-                st.error(f"❌ **{result['name']}** - Failed ({result.get('error_message', 'Unknown error')})")
-        current_status_col = 1 - current_status_col
-    
-    # ZIP Download Section
-    if pdfs_for_zip:
-        st.markdown("---")
-        st.markdown("### 📦 **Download Reports**")
-        st.info(f"💾 {len(pdfs_for_zip)} reports ready for download")
+                elif result['status'] == 'warning':
+                    st.warning(f"⚠️ **{result['name']}** [{recommendation}] - {save_msg}")
+                    if result.get('pdf_bytes') is not None:
+                        pdfs_for_zip.append(result)
+                else:
+                    st.error(f"❌ **{result['name']}** - Failed ({result.get('error_message', 'Unknown error')})")
+            current_status_col = 1 - current_status_col
         
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for result in pdfs_for_zip:
-                safe_name = "".join(c if c.isalnum() else '_' for c in result['name'])
-                pdf_filename = f"{safe_name}_AML_Report.pdf"
-                if result.get('pdf_bytes'):
-                    zipf.writestr(pdf_filename, result['pdf_bytes'])
-        
-        zip_buffer.seek(0)
-        
-        st.download_button(
-            label="📥 **Download All Reports (ZIP)**",
-            data=zip_buffer,
-            file_name=f"AML_Reports_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-            mime="application/zip",
-            type="primary"
-        )
-    elif any(res['status'] == 'success' for res in st.session_state.results_list):
-        st.success("🎉 All reports were saved directly to your local folder!")
+        # ZIP Download Section for PDFs
+        if pdfs_for_zip:
+            st.markdown("---")
+            st.markdown("### 📦 **Download Reports**")
+            st.info(f"💾 {len(pdfs_for_zip)} reports ready for download")
+            
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for result in pdfs_for_zip:
+                    safe_name = "".join(c if c.isalnum() else '_' for c in result['name'])
+                    pdf_filename = f"{safe_name}_AML_Subject_Report.pdf"
+                    if result.get('pdf_bytes'):
+                        zipf.writestr(pdf_filename, result['pdf_bytes'])
+            
+            zip_buffer.seek(0)
+            
+            st.download_button(
+                label="📥 **Download All Reports (ZIP)**",
+                data=zip_buffer,
+                file_name=f"AML_Reports_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                mime="application/zip",
+                type="primary"
+            )
+        elif any(res['status'] == 'success' for res in st.session_state.results_list):
+            st.success("🎉 All reports were saved directly to your local folder!")
 
 # Footer
 st.markdown("---")
-st.markdown("**AML Demo v1.20** | Powered by Perplexity AI & OFAC Database (83% match threshold)") 
+st.markdown("**AML Demo v1.35** | Powered by Perplexity AI & OFAC Database (83% match threshold) | Enhanced with Domain Filtering & Word Documents") 

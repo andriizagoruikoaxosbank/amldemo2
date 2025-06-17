@@ -29,6 +29,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 if 'results_list' not in st.session_state:
     st.session_state.results_list = [] # Initialize if not already present
 
+# Initialize authentication state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
 # --- Page Config (MUST be the first Streamlit command) ---
 st.set_page_config(
     page_title="Axos Internal AML Demo", 
@@ -37,10 +41,68 @@ st.set_page_config(
 )
 
 # Version number
-APP_VERSION = "1.48"
+APP_VERSION = "1.52"
 
-# Configure logging (optional for Streamlit, but can be helpful)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging with enhanced format
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('aml_app.log', mode='a')
+    ]
+)
+
+# Function to get client IP address
+def get_client_ip():
+    """Get the client's IP address from Streamlit context"""
+    try:
+        # Try to get from modern Streamlit context headers
+        try:
+            import streamlit as st
+            headers = st.context.headers
+            if headers:
+                # Check for forwarded headers first (for proxy/load balancer scenarios)
+                forwarded_for = headers.get('x-forwarded-for') or headers.get('x-real-ip')
+                if forwarded_for:
+                    return forwarded_for.split(',')[0].strip()
+        except (AttributeError, ImportError):
+            # Fallback for older Streamlit versions (but this will show deprecation warning)
+            try:
+                from streamlit.web.server.websocket_headers import _get_websocket_headers
+                headers = _get_websocket_headers()
+                if headers:
+                    # Check for forwarded headers first (for proxy/load balancer scenarios)
+                    forwarded_for = headers.get('x-forwarded-for', headers.get('x-real-ip'))
+                    if forwarded_for:
+                        return forwarded_for.split(',')[0].strip()
+            except ImportError:
+                pass
+        
+        # Fallback: try to get from Streamlit runtime
+        import streamlit.runtime.scriptrunner as sr
+        session_info = sr.get_script_run_ctx()
+        if session_info and hasattr(session_info, 'session_id'):
+            return f"session_{session_info.session_id[:8]}"
+            
+    except Exception as e:
+        logging.debug(f"Could not determine client IP: {e}")
+    
+    return "unknown_ip"
+
+# Function to log user requests
+def log_user_request(request_type, company_name, model=None, additional_info=None):
+    """Log user requests with IP address and details"""
+    client_ip = get_client_ip()
+    log_message = f"USER_REQUEST - IP: {client_ip} - Type: {request_type} - Company: '{company_name}'"
+    
+    if model:
+        log_message += f" - Model: {model}"
+    
+    if additional_info:
+        log_message += f" - Info: {additional_info}"
+    
+    logging.info(log_message)
 
 # --- Configuration & API Client Setup ---
 load_dotenv() # Load .env file for local development
@@ -218,12 +280,69 @@ AXOS_LOGO_SVG = """
 </svg>
 """
 
+# --- Authentication System ---
+# Password configuration
+APP_PASSWORD = "AML2024secure!"  # Change this to your desired password
+
+def check_password():
+    """Returns True if the user has entered the correct password."""
+    
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        try:
+            client_ip = get_client_ip()
+        except NameError:
+            client_ip = "unknown_ip"
+        
+        if st.session_state["password"] == APP_PASSWORD:
+            st.session_state["authenticated"] = True
+            logging.info(f"AUTH_SUCCESS - IP: {client_ip} - User successfully authenticated")
+            del st.session_state["password"]  # Don't store password
+        else:
+            st.session_state["authenticated"] = False
+            logging.warning(f"AUTH_FAILED - IP: {client_ip} - Failed authentication attempt")
+
+    if not st.session_state.get("authenticated", False):
+        # Show login form
+        st.markdown("# 🔐 AML Research Platform")
+        st.markdown("### Please enter the access password to continue")
+        
+        st.text_input(
+            "Password", 
+            type="password", 
+            on_change=password_entered, 
+            key="password",
+            placeholder="Enter password to access the system"
+        )
+        
+        if "password" in st.session_state and st.session_state["password"]:
+            if not st.session_state.get("authenticated", False):
+                st.error("❌ Incorrect password. Please try again.")
+        
+        st.info("💡 This system is restricted to authorized personnel only.")
+        return False
+    else:
+        return True
+
+# Check authentication before proceeding
+if not check_password():
+    st.stop()
+
+# Add logout button to sidebar for authenticated users
+with st.sidebar:
+    st.markdown("---")
+    if st.button("🚪 Logout", type="secondary"):
+        st.session_state.authenticated = False
+        logging.info(f"AUTH_LOGOUT - IP: {get_client_ip()} - User logged out")
+        st.rerun()
+
 # --- Core Functions (Adapted from Flask app) ---
 
 def search_with_perplexity(company_name, model="sonar-pro", domain_filter=None):
     # (This function remains largely the same as in app.py)
     # ... (API call logic, prompt, message structure) ...
-    logging.info(f"Starting Perplexity search for company: {company_name} using model: {model}")
+    client_ip = get_client_ip()
+    logging.info(f"SEARCH_START - IP: {client_ip} - Perplexity search for '{company_name}' using model '{model}'")
     if not openai_client:
         logging.error("OpenAI client (for Perplexity) not initialized.")
         return {"status": "failed", "error": "Perplexity API client not initialized.", "answer": None, "citations": [], "aml_grade": None}
@@ -355,6 +474,8 @@ def search_with_perplexity(company_name, model="sonar-pro", domain_filter=None):
 
 def search_with_ofac(query):
     """Search OFAC sanctions database"""
+    client_ip = get_client_ip()
+    logging.info(f"SEARCH_START - IP: {client_ip} - OFAC search for '{query}'")
     try:
         session = requests.Session()
         session.verify = False
@@ -446,7 +567,7 @@ def search_with_ofac(query):
                 results_count = int(count_match.group(1))
         
         if results_count == 0:
-            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective (minimum 83% match threshold).\n\n**Recommendation**: Proceed with standard due diligence protocols."
+            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective.\n\n**Recommendation**: Proceed with standard due diligence protocols."
         
         # Initialize variables at the start
         all_matches = []
@@ -508,7 +629,7 @@ def search_with_ofac(query):
         
         # Check if no matches found
         if len(all_matches) == 0:
-            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective (minimum 83% match threshold).\n\n**Recommendation**: Proceed with standard due diligence protocols."
+            return "✅ **OFAC CLEAR**: No matches found in OFAC sanctions database\n\n**Summary**: Entity appears clean from sanctions perspective.\n\n**Recommendation**: Proceed with standard due diligence protocols."
         
         # Sort matches by score (highest first)
         all_matches.sort(key=lambda x: x['score_num'], reverse=True)
@@ -564,6 +685,8 @@ def search_with_ofac(query):
 
 def search_with_comprehensive(company_name, model="sonar-pro", domain_filter=None):
     """Comprehensive search combining Perplexity AI research with OFAC sanctions screening"""
+    client_ip = get_client_ip()
+    logging.info(f"SEARCH_START - IP: {client_ip} - Comprehensive search for '{company_name}' using model '{model}'")
     try:
         # First, perform OFAC sanctions search
         logging.info(f"Starting comprehensive search for {company_name} - OFAC phase")
@@ -1197,6 +1320,9 @@ if line_count > 0:
             citations = []
             
             with st.spinner(f"🔍 Analyzing {name}..."):
+                # Log the request before processing
+                log_user_request(search_engine, name, selected_model, f"Domain filter: {'Yes' if domain_filter else 'No'}")
+                
                 # Perform search based on selected engine - SAME FOR BOTH FORMATS
                 if search_engine == "Comprehensive (AI + OFAC)":
                     result = search_with_comprehensive(name, selected_model, domain_filter)
@@ -1248,6 +1374,12 @@ if line_count > 0:
                 
                 # PDF generation removed - only Word documents supported
             
+            # Log the completion status
+            if status == "success":
+                logging.info(f"SEARCH_SUCCESS - IP: {get_client_ip()} - '{name}' completed successfully with recommendation: {recommendation}")
+            else:
+                logging.error(f"SEARCH_FAILED - IP: {get_client_ip()} - '{name}' failed: {error_message}")
+            
             st.session_state.results_list.append({
                 'name': name,
                 'status': status,
@@ -1286,6 +1418,7 @@ if st.session_state.results_list:
         st.markdown("### 📄 **Download Word Document**")
         
         try:
+            logging.info(f"DOCUMENT_GENERATION - IP: {get_client_ip()} - Generating Word document for {len(successful_results)} subjects")
             word_bytes = generate_word_document(successful_results)
             
             st.download_button(

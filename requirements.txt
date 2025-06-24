@@ -1,0 +1,17 @@
+# streamlit app dependencies
+streamlit==1.32.0
+python-dotenv==1.0.1
+openai==1.28.0 # Used for Perplexity API
+requests==2.31.0 # Potentially needed by dependencies
+httpx==0.27.0 # RE-ADD: Needed for client config on Streamlit Cloud
+beautifulsoup4==4.12.2 # For parsing OFAC search results
+python-docx==1.1.0 # For Word document generation
+# httpx==0.27.0 # Removed - Not needed for standard client init
+
+# Removed:
+# flask==3.0.2
+# google-generativeai==0.3.2
+# selenium==4.18.1 # Removed
+# webdriver-manager==4.0.1 # Removed
+# tavily-python==0.3.0 # Removed (using Perplexity)
+# WeasyPrint==61.2 # Removed 

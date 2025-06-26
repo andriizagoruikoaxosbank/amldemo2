@@ -2,23 +2,24 @@ import streamlit as st
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-import json
 from datetime import datetime
 import logging
 import re
-import io # For handling PDF data in memory
-import httpx # Re-import httpx
-import zipfile # Import zipfile
-import urllib3 # For suppressing SSL warnings
-import requests # For OFAC search
-from bs4 import BeautifulSoup # For parsing HTML results
-import urllib.parse # For URL encoding
+import io
+import httpx
+import urllib3
+import requests
+from bs4 import BeautifulSoup
+import urllib.parse
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import nsdecls
 from docx.oxml import parse_xml
-from docx.oxml.shared import qn
+
+from functools import lru_cache
+import time
+import base64
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -33,23 +34,237 @@ if 'results_list' not in st.session_state:
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 
+# Initialize performance metrics
+if 'performance_metrics' not in st.session_state:
+    st.session_state.performance_metrics = {
+        'total_searches': 0,
+        'total_processing_time': 0,
+        'last_search_time': 0,
+        'search_times': [],
+        'api_response_times': [],
+        'document_generation_time': 0,
+        'search_history': []
+    }
+
+# Initialize search statistics
+if 'search_stats' not in st.session_state:
+    st.session_state.search_stats = {
+        'total_subjects': 0,
+        'successful_searches': 0,
+        'failed_searches': 0,
+        'ofac_hits': 0,
+        'risk_alerts': 0
+    }
+
 # --- Page Config (MUST be the first Streamlit command) ---
 st.set_page_config(
     page_title="Axos Internal AML Demo", 
-    layout="wide",
+    layout="centered",
     initial_sidebar_state="collapsed"
 )
 
 # Version number
-APP_VERSION = "1.71"
+APP_VERSION = "1.72"
+
+# Custom CSS for enhanced UI/UX
+st.markdown("""
+<style>
+    /* Main container styling */
+    .main { 
+        padding-top: 2rem;
+        background-color: #f8f9fa;
+        max-width: 70%;
+        margin: 0 auto;
+    }
+    
+    /* Container width control */
+    .block-container {
+        max-width: 70%;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }
+    
+    /* Enhanced button styling */
+    .stButton>button {
+        background-color: #0066CC;
+        color: white;
+        font-weight: 600;
+        border-radius: 8px;
+        padding: 0.75rem 2rem;
+        border: none;
+        transition: all 0.3s ease;
+        box-shadow: 0 2px 4px rgba(0,102,204,0.2);
+    }
+    
+    .stButton>button:hover {
+        background-color: #0052A3;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,102,204,0.3);
+    }
+    
+    /* Primary button special styling */
+    .stButton>button[kind="primary"] {
+        background: linear-gradient(135deg, #0066CC 0%, #0052A3 100%);
+        font-size: 1.1rem;
+        padding: 1rem 2.5rem;
+    }
+    
+    /* Metric cards */
+    .metric-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        margin-bottom: 1rem;
+        border: 1px solid #e0e0e0;
+        transition: all 0.3s ease;
+    }
+    
+    .metric-card:hover {
+        box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        transform: translateY(-2px);
+    }
+    
+    /* Status cards */
+    .status-card {
+        background: white;
+        padding: 1.25rem;
+        border-radius: 10px;
+        border-left: 4px solid #0066CC;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+        margin-bottom: 0.75rem;
+    }
+    
+    /* Success/Error styling */
+    .success-card {
+        border-left-color: #28a745;
+        background-color: #f8fff9;
+    }
+    
+    .error-card {
+        border-left-color: #dc3545;
+        background-color: #fff8f8;
+    }
+    
+    /* Text area styling */
+    .stTextArea textarea {
+        border-radius: 8px;
+        border: 2px solid #e0e0e0;
+        transition: all 0.3s ease;
+    }
+    
+    .stTextArea textarea:focus {
+        border-color: #0066CC;
+        box-shadow: 0 0 0 3px rgba(0,102,204,0.1);
+    }
+    
+    /* Select box styling */
+    .stSelectbox > div > div {
+        border-radius: 8px;
+        border: 2px solid #e0e0e0;
+        transition: all 0.3s ease;
+    }
+    
+    .stSelectbox > div > div:hover {
+        border-color: #0066CC;
+    }
+    
+    /* Progress bar enhancement */
+    .stProgress > div > div > div > div {
+        background-color: #0066CC;
+        background-image: linear-gradient(45deg, rgba(255,255,255,.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.15) 50%, rgba(255,255,255,.15) 75%, transparent 75%, transparent);
+        background-size: 1rem 1rem;
+        animation: progress-bar-stripes 1s linear infinite;
+    }
+    
+    @keyframes progress-bar-stripes {
+        from { background-position: 1rem 0; }
+        to { background-position: 0 0; }
+    }
+    
+    /* Headers styling */
+    h1 {
+        color: #1a1a1a;
+        font-weight: 700;
+        letter-spacing: -0.5px;
+    }
+    
+    h2, h3 {
+        color: #333;
+        font-weight: 600;
+    }
+    
+    /* Info boxes */
+    .stInfo {
+        background-color: #e8f4fd;
+        border-color: #0066CC;
+        border-radius: 8px;
+    }
+    
+    /* Success boxes */
+    .stSuccess {
+        background-color: #d4edda;
+        border-color: #28a745;
+        border-radius: 8px;
+    }
+    
+    /* Error boxes */
+    .stError {
+        background-color: #f8d7da;
+        border-color: #dc3545;
+        border-radius: 8px;
+    }
+    
+    /* Download button special styling */
+    .stDownloadButton > button {
+        background-color: #28a745;
+        color: white;
+        font-weight: 600;
+        border-radius: 8px;
+        padding: 0.75rem 2rem;
+        border: none;
+        transition: all 0.3s ease;
+    }
+    
+    .stDownloadButton > button:hover {
+        background-color: #218838;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(40,167,69,0.3);
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background-color: #f1f3f5;
+    }
+    
+    /* Metric value styling */
+    [data-testid="metric-container"] {
+        background-color: white;
+        border: 1px solid #e0e0e0;
+        padding: 1rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    
+    /* Animation for loading states */
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.5; }
+        100% { opacity: 1; }
+    }
+    
+    .loading-pulse {
+        animation: pulse 2s ease-in-out infinite;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Configure logging with enhanced format
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('aml_app.log', mode='a')
+        logging.StreamHandler()  # Remove file handler to improve performance
     ]
 )
 
@@ -105,115 +320,99 @@ def log_user_request(request_type, company_name, model=None, additional_info=Non
     logging.info(log_message)
 
 # --- Configuration & API Client Setup ---
-load_dotenv() # Load .env file for local development
+load_dotenv()  # Load .env file for local development
 
-PERPLEXITY_API_KEY = None
-SOURCE_MESSAGE = "Key Source: Not found yet."
-API_KEY_LOADED_SUCCESSFULLY = False
-
-# 1. Try environment variable
-_raw_key_env = os.getenv('PERPLEXITY_API_KEY')
-if _raw_key_env:
-    PERPLEXITY_API_KEY = _raw_key_env.strip()
-    if PERPLEXITY_API_KEY: # Check if non-empty after strip
-        SOURCE_MESSAGE = "Key Source: Environment Variable"
-        API_KEY_LOADED_SUCCESSFULLY = True
-        logging.info(f"{SOURCE_MESSAGE}")
-    else:
-        logging.warning("Found PERPLEXITY_API_KEY in env vars, but it was empty.")
-
-# 2. If not found in env, try st.secrets
-if not API_KEY_LOADED_SUCCESSFULLY:
-    logging.info("API key not found in env vars, trying st.secrets...")
-    SOURCE_MESSAGE = "Key Source: Streamlit Secrets"
+@st.cache_data
+def load_api_key(key_name):
+    """Load API key from environment or secrets with caching"""
+    # Try environment variable first
+    key = os.getenv(key_name)
+    if key and key.strip():
+        return key.strip(), "Environment Variable"
+    
+    # Try Streamlit secrets
     try:
-        _raw_key_secrets = st.secrets.get("PERPLEXITY_API_KEY") # Use .get for safety
-        if _raw_key_secrets:
-            PERPLEXITY_API_KEY = _raw_key_secrets.strip()
-            if PERPLEXITY_API_KEY:
-                logging.info("Loaded API key from st.secrets")
-                API_KEY_LOADED_SUCCESSFULLY = True
-                # SOURCE_MESSAGE already set
-            else:
-                logging.warning("Found PERPLEXITY_API_KEY in st.secrets, but it was empty after stripping.")
-                SOURCE_MESSAGE = "Key Source: Streamlit Secrets (Empty Key!)"
-        else:
-             logging.warning("PERPLEXITY_API_KEY not found in st.secrets.")
-             SOURCE_MESSAGE = "Key Source: Streamlit Secrets (Not Found)"
-             
-    except FileNotFoundError:
-        logging.info("secrets.toml file not found (expected locally). Skipping st.secrets.")
-        SOURCE_MESSAGE = "Key Source: Streamlit Secrets (File Not Found)"
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while accessing st.secrets: {e}")
-        SOURCE_MESSAGE = f"Key Source: Streamlit Secrets (Error: {e})"
+        key = st.secrets.get(key_name)
+        if key and key.strip():
+            return key.strip(), "Streamlit Secrets"
+    except Exception:
+        pass
+    
+    return None, "Not Found"
+
+# Load API keys
+PERPLEXITY_API_KEY, perplexity_source = load_api_key('PERPLEXITY_API_KEY')
+OPENAI_API_KEY, openai_source = load_api_key('OPENAI_API_KEY')
+API_KEY_LOADED_SUCCESSFULLY = bool(PERPLEXITY_API_KEY)
+SOURCE_MESSAGE = f"Perplexity Key Source: {perplexity_source}"
 
 # --- Add Debugging Output Early --- 
 st.sidebar.info(SOURCE_MESSAGE) # Show where the key was (or wasn't) found
 if API_KEY_LOADED_SUCCESSFULLY:
     # Mask key for display
     masked_key = f"{PERPLEXITY_API_KEY[:7]}...{PERPLEXITY_API_KEY[-4:]}" if PERPLEXITY_API_KEY and len(PERPLEXITY_API_KEY) > 11 else "Invalid Key Format"
-    st.sidebar.success(f"API Key Status: Loaded ({masked_key})")
+    st.sidebar.success(f"Perplexity API Key: Loaded ({masked_key})")
 else:
-    st.sidebar.error("API Key Status: NOT loaded.")
+    st.sidebar.error("Perplexity API Key: NOT loaded.")
+
+# OpenAI API Key status
+if OPENAI_API_KEY:
+    masked_openai_key = f"{OPENAI_API_KEY[:7]}...{OPENAI_API_KEY[-4:]}" if len(OPENAI_API_KEY) > 11 else "Invalid Key Format"
+    st.sidebar.success(f"OpenAI API Key: Loaded ({masked_openai_key}) - Source: {openai_source}")
+else:
+    st.sidebar.warning(f"OpenAI API Key: NOT loaded - Source: {openai_source}")
 # --- End Debugging Output ---
 
 PERPLEXITY_API_BASE_URL = "https://api.perplexity.ai"
 
-openai_client = None
-client_init_error_msg = None
+# Create a shared HTTP client for all requests
+@st.cache_resource
+def get_http_client():
+    """Get a shared HTTP client with SSL disabled"""
+    return httpx.Client(verify=False)
 
-if PERPLEXITY_API_KEY:
-    # Log the key just before use (masked)
-    masked_key_for_log = f"{PERPLEXITY_API_KEY[:7]}...{PERPLEXITY_API_KEY[-4:]}" if PERPLEXITY_API_KEY and len(PERPLEXITY_API_KEY) > 11 else "Invalid Key Format"
-    logging.info(f"Attempting to initialize OpenAI client with key: {masked_key_for_log}")
+# Initialize API clients with singleton pattern
+@st.cache_resource
+def get_perplexity_client():
+    """Get or create Perplexity API client"""
+    if not PERPLEXITY_API_KEY:
+        return None, "No API Key"
+    
     try:
-        # RE-ADD: Explicitly create an httpx client that ignores system proxies
-        http_client = httpx.Client(verify=False)  # Disable SSL verification
-        
-        # RE-ADD: Pass the custom http_client
-        openai_client = OpenAI(
-            api_key=PERPLEXITY_API_KEY, 
+        http_client = get_http_client()
+        client = OpenAI(
+            api_key=PERPLEXITY_API_KEY,
             base_url=PERPLEXITY_API_BASE_URL,
-            http_client=http_client 
+            http_client=http_client
         )
-        logging.info("OpenAI client initialized pointing to Perplexity API.")
+        return client, None
+    except Exception as e:
+        return None, str(e)
+
+# Initialize clients
+openai_client, client_init_error_msg = get_perplexity_client()
+
+# Update sidebar status
+if API_KEY_LOADED_SUCCESSFULLY:
+    if openai_client:
         st.sidebar.success("API Client Status: Initialized.")
-    except Exception as client_init_error:
-        client_init_error_msg = str(client_init_error) 
-        logging.error(f"Failed to initialize OpenAI client: {client_init_error_msg}", exc_info=True)
-        openai_client = None 
+    else:
         st.sidebar.error(f"API Client Status: Failed ({client_init_error_msg})")
 else:
     st.sidebar.warning("API Client Status: Not initialized (No API Key).")
 
-# Error message shown only if client is STILL None
-if not openai_client:
-    # Construct error message without accessing sidebar elements
-    final_error_msg = "ERROR: Perplexity API client could not be initialized. "
+# Error handling
+if not openai_client and ("AI" in st.session_state.get("search_engine", "") or "Comprehensive" in st.session_state.get("search_engine", "")):
+    error_msg = "ERROR: Perplexity API client required but not initialized. "
     if not API_KEY_LOADED_SUCCESSFULLY:
-        final_error_msg += f"API key was not loaded (checked {SOURCE_MESSAGE}). "
+        error_msg += f"API key was not loaded ({SOURCE_MESSAGE}). "
     elif client_init_error_msg:
-        final_error_msg += f"Client initialization failed: {client_init_error_msg}. "
-    else:
-         final_error_msg += "Unknown initialization error. " # Fallback
-    final_error_msg += "Please check API Key, app logs, and verify configuration."
-    
-    st.error(final_error_msg)
+        error_msg += f"Client initialization failed: {client_init_error_msg}. "
+    error_msg += "Please check API Key configuration."
+    st.error(error_msg)
     st.stop()
 
-# --- Helper function for Recommendation Color ---
-def get_recommendation_color(recommendation):
-    if recommendation == 'PROCEED': return "green"
-    if recommendation == 'ENHANCED DUE DILIGENCE': return "orange"
-    if recommendation == 'HIGH RISK': return "#FF4500" # orangered
-    if recommendation == 'DO NOT PROCEED': return "red"
-    return "grey"
-# --- End Helper Function ---
-
-# PDF formatting functions removed - no longer needed
-
-# Markdown helper functions removed - no longer needed for PDF generation
+# Removed unused helper functions for cleaner code
 
 # --- Constants ---
 NEGATIVE_KEYWORDS = '(arrest OR bankruptcy OR BSA OR conviction OR criminal OR fraud OR trafficking OR lawsuit OR "money laundering" OR OFAC OR Ponzi OR terrorist OR violation OR "honorary consul" OR consul OR "Panama Papers" OR theft OR corruption OR bribery)'
@@ -258,38 +457,25 @@ DEFAULT_PERPLEXITY_MODEL = "sonar-pro"
 DEFAULT_COMPREHENSIVE_MODEL = "sonar-pro"
 DEFAULT_OFAC_FALLBACK_MODEL = "sonar-pro"
 
-# Axos Bank Logo (SVG as base64)
-AXOS_LOGO_SVG = """
-<svg width="200" height="60" viewBox="0 0 200 60" xmlns="http://www.w3.org/2000/svg">
-  <!-- Axos logo recreation -->
-  <defs>
-    <style>
-      .axos-text { font-family: Arial, sans-serif; font-weight: bold; }
-      .axos-blue { fill: #2c4f7c; }
-      .axos-orange { fill: #f39c12; }
-    </style>
-  </defs>
-  
-  <!-- Letter 'a' -->
-  <path class="axos-blue" d="M10 45 Q10 15 25 15 Q40 15 40 30 Q40 45 25 45 L15 45 L15 35 L25 35 Q30 35 30 30 Q30 25 25 25 Q20 25 20 30 L20 45 Z"/>
-  
-  <!-- Letter 'x' with orange accent -->
-  <path class="axos-orange" d="M50 15 L65 30 L80 15 L85 20 L70 35 L85 50 L80 55 L65 40 L50 55 L45 50 L60 35 L45 20 Z"/>
-  
-  <!-- Letter 'o' -->
-  <circle class="axos-blue" cx="100" cy="30" r="15" fill="none" stroke="#2c4f7c" stroke-width="8"/>
-  
-  <!-- Letter 's' -->
-  <path class="axos-blue" d="M125 25 Q125 15 135 15 Q145 15 145 25 Q145 30 135 30 Q125 30 125 35 Q125 45 135 45 Q145 45 145 35 L155 35 Q155 55 135 55 Q115 55 115 35 Q115 25 135 25 Q145 25 145 20 Q145 15 135 15 Q125 15 125 25 Z"/>
-  
-  <!-- "BANK" text -->
-  <text x="10" y="58" class="axos-text axos-blue" font-size="8" letter-spacing="3">B A N K</text>
-</svg>
-"""
+# --- Logo Loading Function ---
+@st.cache_data
+def get_axos_logo_base64():
+    """Load and encode the Axos Bank logo"""
+    try:
+        with open("axos_bank.jpg", "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode()
+        return encoded_string
+    except FileNotFoundError:
+        # Return a placeholder if logo file is not found
+        st.warning("Logo file 'axos_bank.jpg' not found. Please add the logo file to the project directory.")
+        return ""
+    except Exception as e:
+        st.error(f"Error loading logo: {str(e)}")
+        return ""
 
 # --- Authentication System ---
-# Password configuration
-APP_PASSWORD = "AML2024secure!"  # Change this to your desired password
+# Password configuration - hardcoded for demo purposes
+APP_PASSWORD = os.getenv('APP_PASSWORD', 'AML2024secure!')
 
 def check_password():
     """Returns True if the user has entered the correct password."""
@@ -343,17 +529,47 @@ with st.sidebar:
         logging.info(f"AUTH_LOGOUT - IP: {get_client_ip()} - User logged out")
         st.rerun()
 
+# --- Helper Functions ---
+def extract_citations(message, response):
+    """Extract and standardize citations from API response"""
+    citations = []
+    raw_citations = []
+    
+    if hasattr(message, 'citations') and message.citations:
+        raw_citations = message.citations
+    elif hasattr(response, 'citations') and response.citations:
+        raw_citations = response.citations
+    
+    for cit in raw_citations:
+        citation_dict = {'url': '#', 'title': 'Source'}
+        if isinstance(cit, dict):
+            citation_dict['url'] = cit.get('url', '#')
+            citation_dict['title'] = cit.get('title', cit.get('url', 'Source'))
+        elif hasattr(cit, 'url'):
+            citation_dict['url'] = getattr(cit, 'url', '#')
+            citation_dict['title'] = getattr(cit, 'title', getattr(cit, 'url', 'Source'))
+        elif isinstance(cit, str):
+            citation_dict['url'] = cit
+            citation_dict['title'] = cit
+        else:
+            citation_dict['title'] = str(cit)
+        citations.append(citation_dict)
+    
+    return citations
+
 # --- Core Functions (Adapted from Flask app) ---
 
-def search_with_perplexity(company_name, model=DEFAULT_PERPLEXITY_MODEL, reasoning_effort="medium"):
+@lru_cache(maxsize=100)
+def search_with_perplexity(company_name, model=DEFAULT_PERPLEXITY_MODEL):
     # (This function remains largely the same as in app.py)
     # ... (API call logic, prompt, message structure) ...
+    start_time = time.time()  # Track API call time
     client_ip = get_client_ip()
     model_config = PERPLEXITY_MODELS.get(model, {})
     logging.info(f"SEARCH_START - IP: {client_ip} - Perplexity search for '{company_name}' using model '{model}' ({model_config.get('name', 'Unknown Model')})")
     if not openai_client:
         logging.error("OpenAI client (for Perplexity) not initialized.")
-        return {"status": "failed", "error": "Perplexity API client not initialized.", "answer": None, "citations": [], "aml_grade": None}
+        return {"status": "failed", "error": "Perplexity API client not initialized.", "answer": None, "citations": []}
     try:
         # Build domain instruction using preferred domains
         domain_instruction = f"\n\nIMPORTANT: Prioritize information from these authoritative domains first: {', '.join(PREFERRED_DOMAINS)}. Search these regulatory, financial, and news sources before other sources as they provide the most reliable AML-relevant information."
@@ -363,7 +579,9 @@ def search_with_perplexity(company_name, model=DEFAULT_PERPLEXITY_MODEL, reasoni
             f"Provide a comprehensive AML (Anti-Money Laundering) due diligence assessment for '{company_name}'. {domain_instruction}"
             f"\n\nStructure your response as follows:"
             f"\n\n## Subject Summary"
-            f"\nProvide a brief summary of the subject '{company_name}', including business activities, key executives, and geographic presence.\n"
+            f"\nProvide a brief summary of the subject '{company_name}', including PRODUCTS and SERVICES offered, business activities, key executives, and geographic presence."
+            f"\n\n### Subject Websites"
+            f"\nIMPORTANT: You MUST include this section. List all official websites for the subject as clickable URLs (e.g., https://example.com). If no websites are found, state: 'This search did not identify potential websites for the subject.'"
             f"\n\n## AML Risk Assessment"
             f"\nAnalyze any negative news found regarding this subject, focusing on: {NEGATIVE_KEYWORDS}. "
             f"Organize findings into clear categories such as 'Financial Crimes', 'Regulatory Issues', 'Legal Proceedings', etc. "
@@ -427,47 +645,41 @@ def search_with_perplexity(company_name, model=DEFAULT_PERPLEXITY_MODEL, reasoni
                 full_answer_content = message.content
                 # No longer extracting recommendations - providing objective findings only
                 recommendation = None
-            # --- Citation Extraction (same as before) ---
-            raw_citations = []
-            # ... (check message.citations, response.citations) ...
-            if hasattr(message, 'citations') and message.citations:
-                 raw_citations = message.citations
-            elif hasattr(response, 'citations') and response.citations:
-                 raw_citations = response.citations
-                 
-            if raw_citations:
-                 for cit in raw_citations:
-                     # ... (standardize to dict) ...
-                     citation_dict = {'url': '#', 'title': 'Source'}
-                     if isinstance(cit, dict):
-                         citation_dict['url'] = cit.get('url', '#')
-                         citation_dict['title'] = cit.get('title', cit.get('url', 'Source'))
-                     elif hasattr(cit, 'url'):
-                          citation_dict['url'] = getattr(cit, 'url', '#')
-                          citation_dict['title'] = getattr(cit, 'title', getattr(cit, 'url', 'Source'))
-                     elif isinstance(cit, str):
-                          citation_dict['url'] = cit
-                          citation_dict['title'] = cit
-                     else:
-                          citation_dict['title'] = str(cit)
-                     citations.append(citation_dict)
+            # Extract citations
+            citations = extract_citations(message, response)
                      
         if not full_answer_content:
             full_answer_content = "No summary could be generated by Perplexity."
+        
+        # Track API response time
+        api_time = time.time() - start_time
+        if 'performance_metrics' in st.session_state:
+            st.session_state.performance_metrics['api_response_times'].append(api_time)
+        logging.info(f"Perplexity API response time: {api_time:.2f}s")
             
-        return {"status": "success", "error": None, "answer": full_answer_content, "citations": citations, "recommendation": recommendation}
+        return {"status": "success", "error": None, "answer": full_answer_content, "citations": citations, "recommendation": recommendation, "api_time": api_time}
 
     except Exception as e:
         logging.error(f"Error during Perplexity search for {company_name}: {str(e)}", exc_info=True)
-        return {"status": "failed", "error": str(e), "answer": None, "citations": [], "recommendation": None}
+        api_time = time.time() - start_time
+        return {"status": "failed", "error": str(e), "answer": None, "citations": [], "recommendation": None, "api_time": api_time}
 
+# Create a shared session for OFAC requests
+@st.cache_resource
+def get_ofac_session():
+    """Get a shared session for OFAC requests"""
+    session = requests.Session()
+    session.verify = False
+    return session
+
+@lru_cache(maxsize=100)
 def search_with_ofac(query):
     """Search OFAC sanctions database"""
+    start_time = time.time()  # Track OFAC search time
     client_ip = get_client_ip()
     logging.info(f"SEARCH_START - IP: {client_ip} - OFAC search for '{query}'")
     try:
-        session = requests.Session()
-        session.verify = False
+        session = get_ofac_session()
         
         # Get the initial page to extract form data
         initial_url = "https://sanctionssearch.ofac.treas.gov/"
@@ -550,7 +762,6 @@ def search_with_ofac(query):
         results_label = result_soup.find('span', {'id': 'ctl00_MainContent_lblResults'})
         if results_label:
             results_text = results_label.get_text()
-            import re
             count_match = re.search(r'(\d+)\s+Found', results_text)
             if count_match:
                 results_count = int(count_match.group(1))
@@ -656,18 +867,29 @@ def search_with_ofac(query):
             result_text += "**Recommendation**: ✅ **PROCEED** - No significant OFAC sanctions concerns identified."
         
         # Add direct search URL
-        import urllib.parse
         encoded_query = urllib.parse.quote(query)
         direct_url = f"https://sanctionssearch.ofac.treas.gov/?search={encoded_query}"
         result_text += f"\n\n**Direct OFAC Search URL**: {direct_url}"
         
+        # Track OFAC search time
+        ofac_time = time.time() - start_time
+        if 'performance_metrics' in st.session_state:
+            st.session_state.performance_metrics['api_response_times'].append(ofac_time)
+        logging.info(f"OFAC search completed in {ofac_time:.2f}s")
+        
         return result_text
         
     except requests.exceptions.Timeout:
+        ofac_time = time.time() - start_time
+        logging.warning(f"OFAC search timed out after {ofac_time:.2f}s")
         return "❌ OFAC search timed out. Please try again."
     except requests.exceptions.RequestException as e:
+        ofac_time = time.time() - start_time
+        logging.error(f"OFAC connection error after {ofac_time:.2f}s: {str(e)}")
         return f"❌ Error connecting to OFAC database: {str(e)}"
     except Exception as e:
+        ofac_time = time.time() - start_time
+        logging.error(f"OFAC search error after {ofac_time:.2f}s: {str(e)}")
         return f"❌ Error during OFAC search: {str(e)}"
 
 # PDF generation function removed - no longer needed
@@ -726,6 +948,9 @@ Based on the OFAC screening results above and your research, provide a comprehen
 - Basic subject information and business activities
 - Key executives and ownership structure
 - Geographic presence and operations
+
+### Subject Websites
+IMPORTANT: You MUST include this section. List all official websites for the subject as clickable URLs (e.g., https://example.com). If no websites are found, state: 'This search did not identify potential websites for the subject.'
 
 ## AML Risk Assessment
 
@@ -808,20 +1033,7 @@ Provide specific examples and cite your sources. Be thorough but concise.
         answer = response.choices[0].message.content
         
         # Extract citations from the response
-        citations = []
-        if hasattr(response, 'citations') and response.citations:
-            for citation in response.citations:
-                if isinstance(citation, dict):
-                    citations.append({
-                        'title': citation.get('title', 'Unknown'),
-                        'url': citation.get('url', '#')
-                    })
-                elif isinstance(citation, str):
-                    # Handle case where citation is just a URL string
-                    citations.append({
-                        'title': 'Source',
-                        'url': citation
-                    })
+        citations = extract_citations(response.choices[0].message if response.choices else None, response)
         
         # Add OFAC as a citation with direct search URL
         citations.append({
@@ -830,7 +1042,6 @@ Provide specific examples and cite your sources. Be thorough but concise.
         })
         
         # Add direct search URL for specific query
-        import urllib.parse
         encoded_query = urllib.parse.quote(company_name)
         search_url = f"https://sanctionssearch.ofac.treas.gov/?search={encoded_query}"
         citations.append({
@@ -862,42 +1073,38 @@ Provide specific examples and cite your sources. Be thorough but concise.
             "recommendation": None
         }
 
+# Initialize OpenAI client for content analysis
+@st.cache_resource
+def get_openai_client():
+    """Get or create OpenAI client for content analysis"""
+    openai_api_key, source = load_api_key('OPENAI_API_KEY')
+    if not openai_api_key:
+        logging.warning(f"OpenAI API key not found. Source: {source}")
+        return None
+    
+    try:
+        http_client = get_http_client()
+        client = OpenAI(api_key=openai_api_key, http_client=http_client)
+        logging.info(f"OpenAI client initialized successfully from {source}")
+        return client
+    except Exception as e:
+        logging.error(f"Failed to initialize OpenAI client: {str(e)}")
+        return None
+
 def analyze_content_findings(answer):
-    """Use GPT-4.1-nano to determine if there are negative findings in the content"""
+    """Use GPT-4.1-mini to determine if there are negative findings in the content"""
     if not answer or not answer.strip():
-        logging.info("Content analysis: No content provided, returning False")
         return False  # No content means no negative findings
     
     # Check if response is too short to be meaningful
     if len(answer.strip()) < 20:
-        logging.info(f"Content analysis: Content too short ({len(answer.strip())} chars), returning False")
         return False  # Too short to contain meaningful negative findings
     
     try:
-        logging.info(f"Content analysis: Analyzing {len(answer)} characters of content with GPT-4.1-mini")
-        
-        # Create OpenAI client for content analysis with SSL disabled
-        http_client = httpx.Client(verify=False)  # Disable SSL verification
-        
-        # Get OpenAI API key from environment or secrets
-        openai_api_key = None
-        try:
-            # Try environment variable first
-            openai_api_key = os.getenv('OPENAI_API_KEY')
-            if not openai_api_key:
-                # Try Streamlit secrets
-                openai_api_key = st.secrets.get("OPENAI_API_KEY")
-        except Exception as e:
-            logging.error(f"Failed to get OpenAI API key: {e}")
-        
-        if not openai_api_key:
-            logging.error("OpenAI API key not found in environment variables or Streamlit secrets")
+        openai_analysis_client = get_openai_client()
+        if not openai_analysis_client:
+            logging.error("OpenAI client not available for content analysis")
             return False  # Conservative fallback
-        
-        openai_analysis_client = OpenAI(
-            api_key=openai_api_key,
-            http_client=http_client
-        )
         
         analysis_prompt = f"""Analyze this AML research content and determine if there are any negative findings about the entity.
 
@@ -952,7 +1159,7 @@ def add_hyperlink(paragraph, url, text):
                 <w:rPr>
                     <w:color w:val="0563C1"/>
                     <w:u w:val="single"/>
-                    <w:sz w:val="18"/>
+                    <w:sz w:val="22"/>
                 </w:rPr>
                 <w:t>{text}</w:t>
             </w:r>
@@ -966,9 +1173,42 @@ def add_hyperlink(paragraph, url, text):
         logging.warning(f"Failed to create clickable hyperlink for {url}: {e}")
         # Fallback to styled text that looks like a link
         hyperlink_run = paragraph.add_run(text)
-        hyperlink_run.font.size = Pt(9)
+        hyperlink_run.font.size = Pt(11)  # Regular text size
         hyperlink_run.font.color.rgb = RGBColor(5, 99, 193)  # Word's default link color
         hyperlink_run.underline = True
+
+def add_text_with_urls(paragraph, text):
+    """Add text to paragraph, converting URLs to clickable hyperlinks"""
+    import re
+    
+    # URL pattern to match http/https URLs
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+[^\s<>"{}|\\^`\[\].,;!?]'
+    
+    # Find all URLs in the text
+    urls = list(re.finditer(url_pattern, text))
+    
+    if not urls:
+        # No URLs found, add as regular text
+        paragraph.add_run(text)
+        return
+    
+    # Process text with URLs
+    last_end = 0
+    
+    for match in urls:
+        # Add text before the URL
+        if match.start() > last_end:
+            paragraph.add_run(text[last_end:match.start()])
+        
+        # Add the URL as a hyperlink
+        url = match.group()
+        add_hyperlink(paragraph, url, url)
+        
+        last_end = match.end()
+    
+    # Add any remaining text after the last URL
+    if last_end < len(text):
+        paragraph.add_run(text[last_end:])
 
 def generate_word_document(results_data):
     """Generate a single Word document containing all subjects with summary table and detailed sections"""
@@ -1078,9 +1318,12 @@ def generate_word_document(results_data):
                         if current_paragraph:
                             para_text = '\n'.join(current_paragraph).strip()
                             if para_text:
-                                # Remove markdown formatting
+                                # Remove markdown formatting but preserve URLs
                                 para_text = para_text.replace('**', '').replace('*', '')
-                                doc.add_paragraph(para_text)
+                                
+                                # Create paragraph and add content with URL detection
+                                para = doc.add_paragraph()
+                                add_text_with_urls(para, para_text)
                             current_paragraph = []
                         
                         # Add H3 heading
@@ -1092,9 +1335,12 @@ def generate_word_document(results_data):
                         if current_paragraph:
                             para_text = '\n'.join(current_paragraph).strip()
                             if para_text:
-                                # Remove markdown formatting
+                                # Remove markdown formatting but preserve URLs
                                 para_text = para_text.replace('**', '').replace('*', '')
-                                doc.add_paragraph(para_text)
+                                
+                                # Create paragraph and add content with URL detection
+                                para = doc.add_paragraph()
+                                add_text_with_urls(para, para_text)
                             current_paragraph = []
                         
                         # Add H2 heading
@@ -1106,9 +1352,12 @@ def generate_word_document(results_data):
                         if current_paragraph:
                             para_text = '\n'.join(current_paragraph).strip()
                             if para_text:
-                                # Remove markdown formatting
+                                # Remove markdown formatting but preserve URLs
                                 para_text = para_text.replace('**', '').replace('*', '')
-                                doc.add_paragraph(para_text)
+                                
+                                # Create paragraph and add content with URL detection
+                                para = doc.add_paragraph()
+                                add_text_with_urls(para, para_text)
                             current_paragraph = []
                         
                         # Add H3 heading for single # (make it bold and larger)
@@ -1123,9 +1372,12 @@ def generate_word_document(results_data):
                         if current_paragraph:
                             para_text = '\n'.join(current_paragraph).strip()
                             if para_text:
-                                # Remove markdown formatting
+                                # Remove markdown formatting but preserve URLs
                                 para_text = para_text.replace('**', '').replace('*', '')
-                                doc.add_paragraph(para_text)
+                                
+                                # Create paragraph and add content with URL detection
+                                para = doc.add_paragraph()
+                                add_text_with_urls(para, para_text)
                             current_paragraph = []
                             
                     else:
@@ -1136,9 +1388,12 @@ def generate_word_document(results_data):
                 if current_paragraph:
                     para_text = '\n'.join(current_paragraph).strip()
                     if para_text:
-                        # Remove markdown formatting
+                        # Remove markdown formatting but preserve URLs
                         para_text = para_text.replace('**', '').replace('*', '')
-                        doc.add_paragraph(para_text)
+                        
+                        # Create paragraph and add content with URL detection
+                        para = doc.add_paragraph()
+                        add_text_with_urls(para, para_text)
                     
             else:
                 # No answer content at all
@@ -1164,15 +1419,17 @@ def generate_word_document(results_data):
                     citation_para = doc.add_paragraph()
                     citation_para.space_after = Pt(3)  # Reduce spacing after paragraph
                     
-                    # Add citation number and title
-                    citation_run = citation_para.add_run(f"{j}. {title}")
-                    citation_run.font.size = Pt(9)  # Smaller font for citations
+                    # Add citation number
+                    citation_num_run = citation_para.add_run(f"{j}. ")
+                    citation_num_run.font.size = Pt(9)
                     
-                    # Add clickable URL if available
+                    # Make the title itself a clickable hyperlink
                     if url != '#' and url:
-                        citation_para.add_run(" - ")
-                        # Create actual clickable hyperlink
-                        add_hyperlink(citation_para, url, url)
+                        add_hyperlink(citation_para, url, title)
+                    else:
+                        # If no URL, just add the title as plain text
+                        title_run = citation_para.add_run(title)
+                        title_run.font.size = Pt(9)
             else:
                 no_sources_para = doc.add_paragraph("No specific sources cited.")
                 no_sources_run = no_sources_para.runs[0]
@@ -1190,9 +1447,22 @@ def generate_word_document(results_data):
     return buffer.getvalue()
 
 # --- Streamlit App UI ---
-st.title("🏦 Axos Bank AML Research Platform")
-st.markdown("**Advanced Anti-Money Laundering Due Diligence System**")
-st.markdown("---")
+# Professional header with Axos logo
+st.markdown("""
+<div style="text-align: center; padding: 2rem 0;">
+    <img src="data:image/jpeg;base64,{logo_base64}" style="max-height: 80px; margin-bottom: 1rem;" alt="Axos Bank">
+    <h1 style="color: #0066CC; font-size: 2.5rem; margin-bottom: 0.5rem; margin-top: 1rem;">
+        AML Research Platform
+    </h1>
+    <div style="margin-top: 1rem;">
+        <span style="background-color: #e8f4fd; color: #0066CC; padding: 0.5rem 1rem; border-radius: 20px; font-weight: 600;">
+            Version {version}
+        </span>
+    </div>
+</div>
+""".format(version=APP_VERSION, logo_base64=get_axos_logo_base64()), unsafe_allow_html=True)
+
+
 
 # Create a clean two-column layout for settings
 col1, col2 = st.columns([1, 1])
@@ -1228,20 +1498,27 @@ with col2:
         selected_model = DEFAULT_OFAC_FALLBACK_MODEL  # Default for OFAC-only
         reasoning_effort = "medium"
 
-# Only require Perplexity client if AI is selected
-if ("AI" in search_engine or "Comprehensive" in search_engine) and not openai_client:
+# Check if we need AI and if client is available
+needs_ai = "AI" in search_engine or "Comprehensive" in search_engine
+if needs_ai and not openai_client:
     st.error("⚠️ Perplexity API client required but not initialized. Please check your API key configuration.")
     st.stop()
 
 st.markdown("---")
 
-# Main input section
-st.markdown("### 📋 **Subject Research Queue**")
+# Main input section with enhanced styling
+st.markdown("""
+<div style="background-color: white; padding: 2rem; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 1rem;">
+    <h3 style="color: #0066CC; margin-top: 0;">📋 Subject Research Queue</h3>
+</div>
+""", unsafe_allow_html=True)
+
 company_names_input = st.text_area(
     "**Subject Names** (one per line)",
     height=150,
     placeholder="Example:\nGazprom\nAxos Financial\nMicrosoft\nJohn Smith\nShell Company Ltd",
-    key="company_names"
+    key="company_names",
+    help="Enter company names, individual names, or entity names for AML screening"
 )
 
 # Show subject count
@@ -1260,15 +1537,15 @@ else:
 st.markdown("### 📄 **Output Format**")
 st.info("📄 Word document will be generated for download")
 output_format = "Single Word Document"  # Fixed format
-destination_path_input = ""  # Not used
+
 
 st.markdown("---")
 
 # Generate Reports Button
 if line_count > 0:
     if st.button("🚀 **Generate AML Reports**", type="primary"):
+        overall_start_time = time.time()  # Track overall processing time
         subject_names = [name.strip() for name in company_names_input.split('\n') if name.strip()]
-        destination_path = destination_path_input.strip()
         
         # Show processing info
         model_name = PERPLEXITY_MODELS.get(selected_model, {}).get("name", selected_model) if "AI" in search_engine or "Comprehensive" in search_engine else "N/A"
@@ -1276,18 +1553,27 @@ if line_count > 0:
         # Show generation mode
         st.info(f"🔄 Processing {len(subject_names)} subjects using **{search_engine}** {f'with **{model_name}**' if model_name != 'N/A' else ''}")
         
+        # Update statistics
+        st.session_state.search_stats['total_subjects'] += len(subject_names)
+        
         st.session_state.results_list = []
         progress_bar = st.progress(0)
+        status_text = st.empty()
         total_names = len(subject_names)
 
         for i, name in enumerate(subject_names):
+            search_start_time = time.time()  # Track individual search time
             status = "failed"
             error_message = "Processing not started."
             recommendation = None
             answer = ""
             citations = []
+            api_time = 0
             
-            with st.spinner(f"🔍 Analyzing {name}..."):
+            # Update status
+            status_text.text(f"🔍 Analyzing {name} ({i+1}/{total_names})...")
+            
+            with st.spinner(f"Processing {name}..."):
                 # Log the request before processing
                 log_user_request(search_engine, name, selected_model)
                 
@@ -1308,7 +1594,7 @@ if line_count > 0:
                         citations = []
                 
                 elif search_engine == "AI Research Only":
-                    result = search_with_perplexity(name, selected_model, reasoning_effort)
+                    result = search_with_perplexity(name, selected_model)
                     if result["status"] == "success":
                         status = "success"
                         error_message = None
@@ -1339,11 +1625,33 @@ if line_count > 0:
                 
                 # PDF generation removed - only Word documents supported
             
+            # Track individual search time
+            search_time = time.time() - search_start_time
+            st.session_state.performance_metrics['search_times'].append(search_time)
+            
             # Log the completion status
             if status == "success":
-                logging.info(f"SEARCH_SUCCESS - IP: {get_client_ip()} - '{name}' completed successfully with recommendation: {recommendation}")
+                logging.info(f"SEARCH_SUCCESS - IP: {get_client_ip()} - '{name}' completed successfully in {search_time:.2f}s with recommendation: {recommendation}")
+                st.session_state.search_stats['successful_searches'] += 1
+                
+                # Check for risk alerts
+                if answer and ("OFAC" in answer and ("match" in answer.lower() or "100%" in answer or "83%" in answer)):
+                    st.session_state.search_stats['ofac_hits'] += 1
+                    st.session_state.search_stats['risk_alerts'] += 1
+                elif answer and analyze_content_findings(answer):
+                    st.session_state.search_stats['risk_alerts'] += 1
             else:
-                logging.error(f"SEARCH_FAILED - IP: {get_client_ip()} - '{name}' failed: {error_message}")
+                logging.error(f"SEARCH_FAILED - IP: {get_client_ip()} - '{name}' failed after {search_time:.2f}s: {error_message}")
+                st.session_state.search_stats['failed_searches'] += 1
+            
+            # Add search to history
+            st.session_state.performance_metrics['search_history'].append({
+                'id': f"{datetime.now().timestamp()}_{i}",
+                'name': name,
+                'time': search_time,
+                'status': status,
+                'timestamp': datetime.now()
+            })
             
             st.session_state.results_list.append({
                 'name': name,
@@ -1351,13 +1659,21 @@ if line_count > 0:
                 'error_message': error_message,
                 'recommendation': recommendation,
                 'answer': answer,
-                'citations': citations
+                'citations': citations,
+                'search_time': search_time
             })
             
             progress_bar.progress((i + 1) / total_names)
 
-        st.success("✅ **Processing Complete!**")
+        # Track overall processing time
+        overall_time = time.time() - overall_start_time
+        st.session_state.performance_metrics['total_processing_time'] += overall_time
+        st.session_state.performance_metrics['last_search_time'] = overall_time
+        st.session_state.performance_metrics['total_searches'] += len(subject_names)
+        
+        st.success(f"✅ **Processing Complete!** Total time: {overall_time:.1f}s ({overall_time/len(subject_names):.1f}s per subject)")
         progress_bar.empty()
+        status_text.empty()
 else:
     st.button("🚀 **Generate AML Reports**", disabled=True, help="Enter subject names first")
 
@@ -1365,6 +1681,41 @@ else:
 if st.session_state.results_list:
     st.markdown("---")
     st.markdown("### 📊 **Processing Results**")
+    
+    # Performance breakdown
+    with st.expander("⏱️ **Performance Breakdown**", expanded=True):
+        perf_col1, perf_col2, perf_col3 = st.columns(3)
+        
+        with perf_col1:
+            if st.session_state.performance_metrics['search_times']:
+                avg_search = sum(st.session_state.performance_metrics['search_times']) / len(st.session_state.performance_metrics['search_times'])
+                st.metric("Average Search Time", f"{avg_search:.2f}s")
+            else:
+                st.metric("Average Search Time", "N/A")
+        
+        with perf_col2:
+            if st.session_state.performance_metrics['api_response_times']:
+                avg_api = sum(st.session_state.performance_metrics['api_response_times']) / len(st.session_state.performance_metrics['api_response_times'])
+                st.metric("Average API Response", f"{avg_api:.2f}s")
+            else:
+                st.metric("Average API Response", "N/A")
+        
+        with perf_col3:
+            doc_time = st.session_state.performance_metrics.get('document_generation_time', 0)
+            if doc_time > 0:
+                st.metric("Document Generation", f"{doc_time:.2f}s")
+            else:
+                st.metric("Document Generation", "N/A")
+        
+        # Show individual search times
+        if st.session_state.results_list:
+            st.markdown("**Individual Search Times:**")
+            for result in st.session_state.results_list:
+                search_time = result.get('search_time', 0)
+                if result['status'] == 'success':
+                    st.success(f"✅ {result['name']}: {search_time:.2f}s")
+                else:
+                    st.error(f"❌ {result['name']}: {search_time:.2f}s (failed)")
     
     # Word document mode - show summary and generate single document
     successful_results = [res for res in st.session_state.results_list if res['status'] == 'success']
@@ -1383,8 +1734,11 @@ if st.session_state.results_list:
         st.markdown("### 📄 **Download Word Document**")
         
         try:
+            doc_start_time = time.time()
             logging.info(f"DOCUMENT_GENERATION - IP: {get_client_ip()} - Generating Word document for {len(successful_results)} subjects")
             word_bytes = generate_word_document(successful_results)
+            doc_gen_time = time.time() - doc_start_time
+            st.session_state.performance_metrics['document_generation_time'] = doc_gen_time
             
             st.download_button(
                 label="📥 **Download AML Due Diligence Report (Word)**",
@@ -1394,7 +1748,7 @@ if st.session_state.results_list:
                 type="primary"
             )
             
-            st.info(f"📋 Document contains summary table and detailed sections for {len(successful_results)} subjects")
+            st.info(f"📋 Document contains summary table and detailed sections for {len(successful_results)} subjects (generated in {doc_gen_time:.1f}s)")
             
         except Exception as e:
             st.error(f"❌ Error generating Word document: {str(e)}")

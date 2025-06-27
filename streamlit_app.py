@@ -448,7 +448,7 @@ PERPLEXITY_MODELS = {
         "name": "Sonar Deep Research", 
         "description": "Exhaustive research across hundreds of sources with expert-level analysis",
         "use_case": "Comprehensive reports and detailed investigations",
-        "max_tokens": 2000
+        "max_tokens": 15000
     }
 }
 
@@ -496,8 +496,21 @@ def check_password():
             logging.warning(f"AUTH_FAILED - IP: {client_ip} - Failed authentication attempt")
 
     if not st.session_state.get("authenticated", False):
-        # Show login form
-        st.markdown("# 🔐 AML Research Platform")
+        # Show login form - logo first, then title
+        # Add Axos Bank logo to top of login screen
+        try:
+            axos_logo_base64 = get_axos_logo_base64()
+            if axos_logo_base64:
+                st.markdown(f"""
+                <div style="display: flex; justify-content: center; margin: 20px 0;">
+                    <img src="data:image/jpeg;base64,{axos_logo_base64}" 
+                         style="height: 60px; width: auto;">
+                </div>
+                """, unsafe_allow_html=True)
+        except Exception as e:
+            logging.warning(f"Could not load Axos logo on login screen: {e}")
+        
+        st.markdown("# AI Center of Excellence - Agentic Research Platform")
         st.markdown("### Please enter the access password to continue")
         
         st.text_input(
@@ -1152,6 +1165,10 @@ def add_hyperlink(paragraph, url, text):
         part = paragraph.part
         r_id = part.relate_to(url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
         
+        # Escape XML special characters in the text
+        import html
+        escaped_text = html.escape(text)
+        
         # Create hyperlink XML
         hyperlink_xml = f'''
         <w:hyperlink r:id="{r_id}" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -1161,7 +1178,7 @@ def add_hyperlink(paragraph, url, text):
                     <w:u w:val="single"/>
                     <w:sz w:val="22"/>
                 </w:rPr>
-                <w:t>{text}</w:t>
+                <w:t>{escaped_text}</w:t>
             </w:r>
         </w:hyperlink>
         '''
@@ -1312,8 +1329,30 @@ def generate_word_document(results_data):
                 for line in lines:
                     line_stripped = line.strip()
                     
-                    # Handle different markdown header levels
-                    if line_stripped.startswith('### '):
+                    # Debug: Log header detection
+                    if line_stripped.startswith('#'):
+                        logging.info(f"Header detected: '{line_stripped}' for {result['name']}")
+                    
+                    # Handle different markdown header levels (check longest patterns first)
+                    if line_stripped.startswith('#### '):
+                        # Process any accumulated paragraph content
+                        if current_paragraph:
+                            para_text = '\n'.join(current_paragraph).strip()
+                            if para_text:
+                                # Remove markdown formatting but preserve URLs
+                                para_text = para_text.replace('**', '').replace('*', '')
+                                
+                                # Create paragraph and add content with URL detection
+                                para = doc.add_paragraph()
+                                add_text_with_urls(para, para_text)
+                            current_paragraph = []
+                        
+                        # Add H4 heading
+                        header_text = line_stripped[5:].strip()
+                        logging.info(f"Creating H4 heading: '{header_text}'")
+                        doc.add_heading(header_text, level=4)
+                        
+                    elif line_stripped.startswith('### '):
                         # Process any accumulated paragraph content
                         if current_paragraph:
                             para_text = '\n'.join(current_paragraph).strip()
@@ -1328,6 +1367,7 @@ def generate_word_document(results_data):
                         
                         # Add H3 heading
                         header_text = line_stripped[4:].strip()
+                        logging.info(f"Creating H3 heading: '{header_text}'")
                         doc.add_heading(header_text, level=3)
                         
                     elif line_stripped.startswith('## '):
@@ -1345,6 +1385,7 @@ def generate_word_document(results_data):
                         
                         # Add H2 heading
                         header_text = line_stripped[3:].strip()
+                        logging.info(f"Creating H2 heading: '{header_text}'")
                         doc.add_heading(header_text, level=2)
                         
                     elif line_stripped.startswith('# '):
